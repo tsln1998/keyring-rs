@@ -1,0 +1,39 @@
+[package]
+name = "keyring-cli"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "keyring_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keyring"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+keyring-core.workspace = true
+keyring-providers.workspace = true
+keyring-service.workspace = true
+rustls-rustcrypto.workspace = true
+serde.workspace = true
+serde_path_to_error.workspace = true
+ssh-agent-lib.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

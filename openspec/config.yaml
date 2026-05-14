@@ -1,0 +1,81 @@
+schema: spec-driven
+
+context: |
+  Project: keyring-rs
+
+  Language conventions:
+  - Specifications must be written in English.
+  - Code comments and inline documentation must be written in English.
+  - Crate names, type names, and module names should follow Rust naming conventions.
+
+  Product shape:
+  - This project is a Rust SSH agent service.
+  - It runs as a single foreground service process.
+  - It has no subcommands.
+  - It is configured declaratively rather than through interactive commands.
+  - The architecture should allow future provider expansion.
+
+  Workspace crates:
+  - keyring-cli: binary entrypoint, config loading, Unix socket lifecycle, and service wiring.
+  - keyring-core: provider-agnostic domain contracts.
+  - keyring-service: ssh-agent-lib agent behavior and provider-driven signing.
+  - keyring-providers: bundled provider implementations such as dummy and Bitwarden.
+
+  Architecture constraints:
+  - Do not collapse CLI wiring, service signing logic, and provider logic back into one crate.
+  - keyring-core should stay small and stable.
+  - keyring-service owns ssh-agent-lib integration and provider-driven signing behavior.
+  - keyring-cli owns config parsing and Unix socket lifecycle.
+  - Provider-specific behavior should stay inside provider crates rather than leaking into core abstractions.
+
+  Preferred Rust stack:
+  - async runtime: tokio
+  - config and serialization: serde, toml
+  - logging and diagnostics: tracing, tracing-subscriber
+  - errors: thiserror, anyhow
+  - secrets handling: secrecy
+  - HTTP client: reqwest
+  - SSH agent protocol and SSH key primitives: ssh-agent-lib
+  - async traits: async-trait
+  - bytes/buffers: bytes
+  - websocket and realtime support may use tokio-tungstenite or an equivalent Tokio-friendly crate
+  - MessagePack support may use rmp-serde or an equivalent serde-friendly crate if needed
+
+  Design preferences:
+  - Favor explicit trait boundaries over large cross-cutting utility modules.
+  - Prefer strongly typed config and DTO models.
+  - Keep provider-specific DTOs and crypto/decryption logic inside provider crates.
+  - Prefer conservative logging; never expose passwords, client secrets, or private keys.
+  - Prefer testable modules with clear ownership and minimal hidden global state.
+  - During task implementation, keep the code clean, readable, and easy to review.
+  - Avoid unnecessary abstraction, duplicated logic, and premature splitting.
+  - Prefer mature ecosystem crates over reimplementing common infrastructure from scratch.
+  - Keep implementations idiomatic Rust and prefer simple, maintainable module boundaries.
+
+rules:
+  proposal:
+    - Include Goal, Scope, Non-goals, Architecture Impact, Risks, and Open
+      Questions when relevant.
+    - Keep the design grounded in the existing workspace crate split.
+    - Do not introduce subcommands, hot reload, or identity allowlist
+      configuration unless explicitly requested.
+  spec:
+    - Write the full spec in English.
+    - Use Rust terminology and crate boundaries consistently.
+    - Organize the spec by crate and use crate names directly when naming major sections or artifacts.
+    - Prefer crate-oriented specifications instead of feature-only or layer-only naming.
+    - Keep the spec at the architectural and module-contract level unless
+      lower-level detail is explicitly requested.
+    - Do not bake unstable implementation details or provider API minutiae into
+      generic specifications.
+    - Separate provider-agnostic contracts from CLI wiring and service signing concerns.
+  tasks:
+    - Break work by crate or module boundary.
+    - Keep task descriptions in English.
+    - Prefer tasks that keep each crate focused and avoid reintroducing a
+      monolithic main crate.
+    - Include verification tasks for config parsing, provider integration, agent behavior,
+      and socket lifecycle when implementation work is planned.
+    - Favor solutions that improve readability and reuse existing libraries
+      instead of rebuilding common components.
+    - Keep code comments, doc comments, and implementation-facing notes in English.

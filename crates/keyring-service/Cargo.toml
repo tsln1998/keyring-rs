@@ -1,0 +1,20 @@
+[package]
+name = "keyring-service"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+keyring-core.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+signature.workspace = true
+ssh-agent-lib.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
