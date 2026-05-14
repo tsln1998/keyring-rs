@@ -20,7 +20,9 @@ indoc = "2.0.7"
 keyring-core = { path = "crates/keyring-core" }
 keyring-providers = { path = "crates/keyring-providers" }
 keyring-service = { path = "crates/keyring-service" }
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-webpki-roots-no-provider"] }
+reqwest = { version = "0.12.28", default-features = false, features = [
+  "rustls-tls-webpki-roots-no-provider",
+] }
 rsa = "0.9.10"
 rustls-rustcrypto = "0.0.2-alpha"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -45,9 +47,14 @@ toml = "0.8.23"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Pipes",
+] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
 unused_lifetimes = "warn"
 unused_qualifications = "warn"
 
