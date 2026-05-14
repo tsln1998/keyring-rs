@@ -14,7 +14,8 @@
 
 use anyhow::{Context, Result, bail};
 use core::fmt;
-use keyring_core::provider::KeyPairProvider;
+use itertools::Itertools;
+use keyring_core::provider::{KeyPair, KeyPairProvider};
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use sha2::{Sha256, Sha512};
 use signature::{SignatureEncoding, Signer};
@@ -23,11 +24,16 @@ use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::Extension;
 use ssh_agent_lib::proto::extension::{QueryResponse, SessionBind};
 use ssh_agent_lib::proto::{Identity as AgentIdentity, RSA_SHA2_256, RSA_SHA2_512, SignRequest};
+use ssh_agent_lib::ssh_key::public::KeyData;
 use ssh_agent_lib::ssh_key::{Algorithm, PrivateKey};
 use ssh_agent_lib::ssh_key::{HashAlg, Signature};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info};
+
+const EXTENSION_NAME_QUERY: &str = "query";
+const EXTENSION_NAME_SESSION_BIND: &str = "session-bind@openssh.com";
 
 /// SSH agent implementation that carries providers into each session.
 pub struct ServiceAgent {
@@ -39,17 +45,17 @@ struct ServiceSession {
     /// Shared provider list inherited from the parent service agent.
     providers: Arc<Vec<Box<dyn KeyPairProvider>>>,
     /// Per-session cache populated on the first request that needs identities.
-    keys: OnceCell<Arc<[PrivateKey]>>,
+    ///
+    /// The public key blob is used as the lookup key so sign requests can resolve to the cached
+    /// private key in O(1) time.
+    keys: OnceCell<HashMap<KeyData, KeyPair>>,
     /// Accepted session-bind records for this agent connection.
-    session_bindings: Vec<SessionBinding>,
+    bindings: Vec<ServiceBinding>,
 }
 
-const QUERY_EXTENSION_NAME: &str = "query";
-const SESSION_BIND_EXTENSION_NAME: &str = "session-bind@openssh.com";
-
-struct SessionBinding {
-    session_id: Vec<u8>,
-    is_forwarding: bool,
+struct ServiceBinding {
+    id: Vec<u8>,
+    forwarding: bool,
 }
 
 impl ServiceAgent {
@@ -63,11 +69,17 @@ impl ServiceAgent {
             bail!("at least one provider must be configured");
         }
 
-        info!(provider_count = providers.len(), "creating service agent");
+        info!(count = providers.len(), "creating service agent");
 
         Ok(Self {
             providers: Arc::new(providers),
         })
+    }
+}
+
+impl ServiceBinding {
+    pub fn new(id: Vec<u8>, forwarding: bool) -> Self {
+        Self { id, forwarding }
     }
 }
 
@@ -80,7 +92,7 @@ where
         ServiceSession {
             providers: Arc::clone(&self.providers),
             keys: OnceCell::new(),
-            session_bindings: Vec::new(),
+            bindings: Vec::new(),
         }
     }
 }
@@ -88,34 +100,30 @@ where
 #[ssh_agent_lib::async_trait]
 impl Session for ServiceSession {
     async fn request_identities(&mut self) -> Result<Vec<AgentIdentity>, AgentError> {
-        debug!("request_identities received");
         let keys = self
             .load_once()
             .await
             .map_err(|error| AgentError::other(std::io::Error::other(format!("{error:#}"))))?;
 
         // The agent protocol publishes only public key blobs plus comments; the private key data
-        // remains cached inside the session for future signing requests.
+        // remains cached inside the session for future signing requests. We sort by `KeyData`
+        // before returning because `HashMap` iteration order is intentionally unstable.
         let identities: Vec<_> = keys
             .iter()
-            .map(|key| AgentIdentity {
-                pubkey: key.public_key().key_data().clone(),
+            .map(|(pubkey, key)| AgentIdentity {
+                pubkey: pubkey.clone(),
                 comment: key.comment().to_owned(),
             })
+            .sorted_by(|left, right| left.pubkey.cmp(&right.pubkey))
             .collect();
-        info!(
-            identity_count = identities.len(),
-            "publishing identities for session"
-        );
+
+        info!(count = identities.len(), "publishing identities for session");
         Ok(identities)
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        debug!(
-            flags = request.flags,
-            payload_len = request.data.len(),
-            "sign request received"
-        );
+        debug!(flags = request.flags, len = request.data.len(), "sign request received");
+
         let keys = self
             .load_once()
             .await
@@ -123,19 +131,17 @@ impl Session for ServiceSession {
 
         // Clients refer to identities by their public key blob, so we resolve the request back
         // to the cached private key before signing.
-        let key = keys
-            .iter()
-            .find(|key| key.public_key().key_data() == &request.pubkey)
-            .ok_or_else(|| {
-                error!("sign request referenced unpublished public key");
-                AgentError::other(std::io::Error::other(
-                    "no published identity matched the requested public key blob",
-                ))
-            })?;
+        let key = keys.get(&request.pubkey).ok_or_else(|| {
+            error!("sign request referenced unpublished public key");
+            AgentError::other(std::io::Error::other(
+                "no published identity matched the requested public key blob",
+            ))
+        })?;
 
-        let signature = Self::sign(key, &request.data, request.flags)
+        let signature = Self::sign(key.as_ref(), &request.data, request.flags)
             .map_err(|error| AgentError::other(std::io::Error::other(format!("{error:#}"))))?;
-        debug!(algorithm = %signature.algorithm().as_str(), "sign request completed");
+
+        debug!(alg = %signature.algorithm().as_str(), "sign request completed");
         Ok(signature)
     }
 
@@ -143,19 +149,16 @@ impl Session for ServiceSession {
         debug!(name = %extension.name, "agent extension request received");
 
         match extension.name.as_str() {
-            QUERY_EXTENSION_NAME => {
+            EXTENSION_NAME_QUERY => {
                 // OpenSSH clients may probe extension support before using non-core messages.
                 let response = Extension::new_message(QueryResponse {
-                    extensions: vec![
-                        QUERY_EXTENSION_NAME.into(),
-                        SESSION_BIND_EXTENSION_NAME.into(),
-                    ],
+                    extensions: vec![EXTENSION_NAME_QUERY.into(), EXTENSION_NAME_SESSION_BIND.into()],
                 })
                 .map_err(AgentError::other)?;
                 debug!("reporting supported agent extensions");
                 Ok(Some(response))
             }
-            SESSION_BIND_EXTENSION_NAME => {
+            EXTENSION_NAME_SESSION_BIND => {
                 // Windows OpenSSH sends `session-bind@openssh.com` before the first sign request.
                 // Accepting it keeps parity with the built-in agent path and avoids failing the
                 // whole connection on an otherwise valid authentication flow.
@@ -164,50 +167,34 @@ impl Session for ServiceSession {
                     .map_err(|error| {
                         error!(error = ?error, "failed to parse session-bind extension");
                         AgentError::ExtensionFailure
-                    })?
-                    .ok_or_else(|| {
-                        error!("session-bind extension payload did not match its declared type");
-                        AgentError::ExtensionFailure
+                    })
+                    .and_then(|bind| {
+                        bind.ok_or_else(|| {
+                            error!("session-bind extension payload did not match its declared type");
+                            AgentError::ExtensionFailure
+                        })
+                    })
+                    .and_then(|bind| {
+                        bind.verify_signature().map_err(|error| {
+                            error!(error = ?error, "session-bind signature verification failed");
+                            AgentError::ExtensionFailure
+                        })?;
+                        Ok(bind)
                     })?;
 
-                bind.verify_signature().map_err(|error| {
-                    error!(error = ?error, "session-bind signature verification failed");
-                    AgentError::ExtensionFailure
-                })?;
-
-                if self
-                    .session_bindings
-                    .iter()
-                    .any(|binding| binding.session_id == bind.session_id)
-                {
-                    error!(
-                        session_id_len = bind.session_id.len(),
-                        "duplicate session-bind received for the same connection"
-                    );
+                if self.bindings.iter().any(|binding| binding.id == bind.session_id) {
+                    error!("duplicate session-bind received for the same connection");
                     return Err(AgentError::ExtensionFailure);
                 }
 
-                if self
-                    .session_bindings
-                    .iter()
-                    .any(|binding| !binding.is_forwarding)
-                {
-                    error!(
-                        "refusing session-bind after the connection was already bound for authentication"
-                    );
+                if self.bindings.iter().any(|binding| !binding.forwarding) {
+                    error!("refusing session-bind after the connection was already bound for authentication");
                     return Err(AgentError::ExtensionFailure);
                 }
 
-                let session_id_len = bind.session_id.len();
-                let is_forwarding = bind.is_forwarding;
-                self.session_bindings.push(SessionBinding {
-                    session_id: bind.session_id,
-                    is_forwarding,
-                });
-                info!(
-                    binding_count = self.session_bindings.len(),
-                    session_id_len, is_forwarding, "accepted session-bind for agent connection"
-                );
+                self.bindings
+                    .push(ServiceBinding::new(bind.session_id, bind.is_forwarding));
+
                 Ok(None)
             }
             _ => {
@@ -222,7 +209,7 @@ impl std::fmt::Debug for ServiceAgent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServiceAgent")
-            .field("provider_count", &self.providers.len())
+            .field("providers", &self.providers.len())
             .finish()
     }
 }
@@ -231,71 +218,43 @@ impl std::fmt::Debug for ServiceSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServiceSession")
-            .field("provider_count", &self.providers.len())
-            .field("keys_loaded", &self.keys.initialized())
-            .field("session_binding_count", &self.session_bindings.len())
+            .field("loaded", &self.keys.initialized())
+            .field("providers", &self.providers.len())
+            .field("bindings", &self.bindings.len())
             .finish()
     }
 }
 
 impl ServiceSession {
     /// Loads and memoizes the provider snapshot for the lifetime of one client connection.
-    async fn load_once(&self) -> Result<Arc<[PrivateKey]>> {
+    async fn load_once(&self) -> Result<&HashMap<KeyData, KeyPair>> {
         // A single session should observe one consistent key snapshot even if it makes multiple
         // `request_identities` and `sign` calls back to back.
-        let cache_hit = self.keys.initialized();
-        debug!(cache_hit, "loading provider snapshot for session");
         self.keys
             .get_or_try_init(|| async {
                 info!("initializing provider snapshot for session");
-                self.load().await.map(Arc::<[PrivateKey]>::from)
+                self.load().await
             })
             .await
-            .map(Arc::clone)
     }
 
-    /// Pulls keys from every configured provider and normalizes the final ordering.
-    async fn load(&self) -> Result<Vec<PrivateKey>> {
-        let mut keys = Vec::new();
+    /// Pulls already-normalized key snapshots from every configured provider and indexes them by
+    /// public key so later sign requests can avoid re-scanning the full snapshot.
+    async fn load(&self) -> Result<HashMap<KeyData, KeyPair>> {
+        let mut keys = HashMap::new();
 
         for (index, provider) in self.providers.iter().enumerate() {
-            debug!(provider_index = index, "loading provider keys");
-            let mut loaded = provider
+            let loaded = provider
                 .load()
                 .await
                 .with_context(|| format!("provider load failed at index {index}"))?;
-            info!(
-                provider_index = index,
-                loaded_key_count = loaded.len(),
-                "provider returned keys"
-            );
 
-            // Deterministic per-provider ordering keeps `ssh-add -L` output stable across
-            // reloads and makes tests independent from provider iteration order.
-            loaded.sort_by(|left, right| {
-                left.comment()
-                    .cmp(right.comment())
-                    .then_with(|| left.algorithm().as_str().cmp(right.algorithm().as_str()))
-                    .then_with(|| {
-                        left.public_key()
-                            .to_bytes()
-                            .expect("validated public key should encode")
-                            .cmp(
-                                &right
-                                    .public_key()
-                                    .to_bytes()
-                                    .expect("validated public key should encode"),
-                            )
-                    })
-            });
+            info!(provider = index, count = loaded.len(), "provider returned keys");
 
-            keys.extend(loaded);
+            keys.extend(loaded.iter().map(|key| (KeyData::from(key.as_ref()), Arc::clone(key))));
         }
 
-        info!(
-            total_key_count = keys.len(),
-            "assembled provider key snapshot"
-        );
+        info!(count = keys.len(), "assembled provider key index");
         Ok(keys)
     }
 

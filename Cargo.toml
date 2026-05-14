@@ -17,6 +17,7 @@ bitwarden-crypto = "2.0.0"
 clap = { version = "4.5.38", features = ["derive"] }
 futures-util = "0.3.32"
 indoc = "2.0.7"
+itertools = "0.14.0"
 keyring-core = { path = "crates/keyring-core" }
 keyring-providers = { path = "crates/keyring-providers" }
 keyring-service = { path = "crates/keyring-service" }

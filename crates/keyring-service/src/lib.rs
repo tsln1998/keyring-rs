@@ -37,14 +37,15 @@
 //!
 //! #[ssh_agent_lib::async_trait]
 //! impl KeyPairProvider for CountingProvider {
-//!     async fn load(&self) -> Result<Vec<PrivateKey>, anyhow::Error> {
+//!     async fn load(&self) -> Result<Arc<[Arc<PrivateKey>]>, anyhow::Error> {
 //!         self.load_calls.fetch_add(1, Ordering::SeqCst);
-//!         Ok(self
-//!             .identities
-//!             .iter()
-//!             .cloned()
-//!             .map(|identity| identity.private_key)
-//!             .collect())
+//!         Ok(Arc::<[Arc<PrivateKey>]>::from(
+//!             self.identities
+//!                 .iter()
+//!                 .cloned()
+//!                 .map(|identity| Arc::new(identity.private_key))
+//!                 .collect::<Vec<_>>(),
+//!         ))
 //!     }
 //! }
 //!
@@ -67,7 +68,7 @@
 //!             .iter()
 //!             .map(|identity| identity.comment.as_str())
 //!             .collect::<Vec<_>>(),
-//!         vec!["alpha", "zeta"]
+//!         vec!["zeta", "alpha"]
 //!     );
 //!     assert!(identities.iter().all(|identity| {
 //!         !PublicKey::from(identity.pubkey.clone())
@@ -112,14 +113,15 @@
 //!
 //! #[ssh_agent_lib::async_trait]
 //! impl KeyPairProvider for CountingProvider {
-//!     async fn load(&self) -> Result<Vec<PrivateKey>, anyhow::Error> {
+//!     async fn load(&self) -> Result<Arc<[Arc<PrivateKey>]>, anyhow::Error> {
 //!         self.load_calls.fetch_add(1, Ordering::SeqCst);
-//!         Ok(self
-//!             .identities
-//!             .iter()
-//!             .cloned()
-//!             .map(|identity| identity.private_key)
-//!             .collect())
+//!         Ok(Arc::<[Arc<PrivateKey>]>::from(
+//!             self.identities
+//!                 .iter()
+//!                 .cloned()
+//!                 .map(|identity| Arc::new(identity.private_key))
+//!                 .collect::<Vec<_>>(),
+//!         ))
 //!     }
 //! }
 //!

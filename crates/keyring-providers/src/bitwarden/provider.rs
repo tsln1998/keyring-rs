@@ -62,9 +62,10 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bitwarden_crypto::KeyStore;
 use keyring_core::cell::CacheCell;
-use keyring_core::provider::KeyPairProvider;
+use keyring_core::provider::{KeyPairProvider, KeyPairSnapshot};
 use ssh_agent_lib::ssh_key::PrivateKey;
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, trace};
@@ -75,22 +76,20 @@ pub struct BitwardenProvider {
     config: BitwardenProviderConfig,
     /// Lazily initialized local Bitwarden session reused across load calls.
     session: OnceCell<BitwardenSession>,
-    /// Time-bounded cache of decrypted SSH keys so agent requests do not trigger a full vault sync
-    /// every time the service asks this provider to publish identities.
-    keys: CacheCell<Vec<PrivateKey>>,
+    /// Time-bounded cache of decrypted SSH-key snapshots so agent requests do not trigger a full
+    /// vault sync every time the service asks this provider to publish identities.
+    keys: CacheCell<KeyPairSnapshot>,
 }
 
 #[async_trait]
 impl KeyPairProvider for BitwardenProvider {
-    async fn load(&self) -> Result<Vec<PrivateKey>, anyhow::Error> {
+    async fn load(&self) -> Result<KeyPairSnapshot, anyhow::Error> {
         // Provider loads may happen repeatedly inside one agent lifetime. Keep the expensive vault
         // sync and decryption work behind a one-hour cache, but still surface the last refresh
         // error when the cache is cold or expired.
         debug!(provider = %self.config.name, "loading bitwarden provider keys");
         self.keys
-            .get_or_try_init(Duration::from_secs(60 * 60), || async {
-                self.fetch().await
-            })
+            .get_or_try_init(Duration::from_secs(60 * 60), || async { self.fetch().await })
             .await
     }
 }
@@ -125,7 +124,7 @@ impl Debug for BitwardenProvider {
 
 impl BitwardenProvider {
     /// Executes one full Bitwarden refresh cycle and returns the currently discoverable SSH keys.
-    async fn fetch(&self) -> Result<Vec<PrivateKey>, anyhow::Error> {
+    async fn fetch(&self) -> Result<KeyPairSnapshot, anyhow::Error> {
         info!(provider = %self.config.name, "starting bitwarden fetch cycle");
 
         // Step 1: create or reuse the local Bitwarden session for this provider instance.
@@ -145,24 +144,18 @@ impl BitwardenProvider {
         session.initialize_org_keys(profile)?;
 
         // Step 4: walk the synchronized ciphers and keep only usable SSH private keys.
-        let keys = self.discover(
-            response.ciphers.as_deref().unwrap_or(&[]),
-            session.keystore(),
-        );
-        info!(provider = %self.config.name, key_count = keys.len(), "completed bitwarden fetch cycle");
-        Ok(keys)
+        let keys = self.discover(response.ciphers.as_deref().unwrap_or(&[]), session.keystore());
+        Ok(Arc::<[Arc<PrivateKey>]>::from(
+            keys.into_iter().map(Arc::new).collect::<Vec<_>>(),
+        ))
     }
 
     /// Walks the synchronized cipher list and keeps only successfully parsed SSH private keys.
-    fn discover(
-        &self,
-        ciphers: &[BitwardenCipher],
-        keystore: &KeyStore<BitwardenKeyIds>,
-    ) -> Vec<PrivateKey> {
+    fn discover(&self, ciphers: &[BitwardenCipher], keystore: &KeyStore<BitwardenKeyIds>) -> Vec<PrivateKey> {
         // Preserve source order for logs and debugging, while letting `parse` decide which entries
         // are usable.
         let mut keys = vec![];
-        debug!(provider = %self.config.name, cipher_count = ciphers.len(), "discovering bitwarden ssh keys");
+        debug!(provider = %self.config.name, count = ciphers.len(), "discovering bitwarden ssh keys");
 
         for cipher in ciphers {
             // Discovery failures are logged and skipped so one malformed vault entry does not
@@ -170,10 +163,10 @@ impl BitwardenProvider {
             match Self::parse(cipher, keystore) {
                 Ok(Some(key)) => keys.push(key),
                 Ok(None) => {
-                    debug!(provider = %self.config.name, cipher_id = ?cipher.id, "skipping non-usable bitwarden cipher");
+                    debug!(provider = %self.config.name, cipher = ?cipher.id, "skipping non-usable bitwarden cipher");
                 }
                 Err(err) => {
-                    error!(provider = %self.config.name, cipher_id = ?cipher.id, error = %err, "failed to parse bitwarden cipher");
+                    error!(provider = %self.config.name, cipher = ?cipher.id, error = %err, "failed to parse bitwarden cipher");
                 }
             }
         }
@@ -182,13 +175,10 @@ impl BitwardenProvider {
     }
 
     /// Converts one synchronized Bitwarden cipher into an SSH private key when possible.
-    fn parse(
-        cipher: &BitwardenCipher,
-        keystore: &KeyStore<BitwardenKeyIds>,
-    ) -> Result<Option<PrivateKey>> {
+    fn parse(cipher: &BitwardenCipher, keystore: &KeyStore<BitwardenKeyIds>) -> Result<Option<PrivateKey>> {
         // Guard clause group 1: only live SSH-key ciphers can produce identities.
         if !cipher.is_ssh_key() {
-            trace!(cipher_id = ?cipher.id, cipher_type = ?cipher.r#type, "skipping non-ssh bitwarden cipher");
+            trace!(cipher = ?cipher.id, kind = ?cipher.r#type, "skipping non-ssh bitwarden cipher");
             return Ok(None);
         }
 
@@ -197,7 +187,7 @@ impl BitwardenProvider {
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         {
-            trace!(cipher_id = ?cipher.id, "skipping deleted bitwarden cipher");
+            trace!(cipher = ?cipher.id, "skipping deleted bitwarden cipher");
             return Ok(None);
         }
 
@@ -214,10 +204,8 @@ impl BitwardenProvider {
         // the OpenSSH private key text.
         let mut ctx = keystore.context_mut();
         let resolved_key = resolve_cipher_key(&mut ctx, cipher)?;
-        let decrypted_name =
-            decrypt_optional_string(&mut ctx, resolved_key, cipher.name.as_deref())?;
-        let decrypted_private_key =
-            decrypt_optional_string(&mut ctx, resolved_key, ssh_key.private_key.as_deref())?;
+        let decrypted_name = decrypt_optional_string(&mut ctx, resolved_key, cipher.name.as_deref())?;
+        let decrypted_private_key = decrypt_optional_string(&mut ctx, resolved_key, ssh_key.private_key.as_deref())?;
 
         // Missing private-key text means the cipher claims to be an SSH key but cannot currently
         // yield a usable identity.
@@ -234,9 +222,8 @@ impl BitwardenProvider {
             .map_or_else(|| format!("bitwarden:{cipher_id}"), ToOwned::to_owned);
 
         // Step 3: parse the OpenSSH private key into the runtime representation used by the agent.
-        let mut private_key = PrivateKey::from_openssh(&private_key_text).with_context(|| {
-            format!("failed to parse bitwarden ssh private key for cipher {cipher_id}")
-        })?;
+        let mut private_key = PrivateKey::from_openssh(&private_key_text)
+            .with_context(|| format!("failed to parse bitwarden ssh private key for cipher {cipher_id}"))?;
         private_key.set_comment(comment);
 
         Ok(Some(private_key))

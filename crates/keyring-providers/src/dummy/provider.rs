@@ -37,21 +37,22 @@
 use crate::dummy::config::DummyProviderConfig;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use keyring_core::provider::KeyPairProvider;
+use keyring_core::provider::{KeyPairProvider, KeyPairSnapshot};
 use ssh_agent_lib::ssh_key::PrivateKey;
 use ssh_agent_lib::ssh_key::private::Ed25519Keypair;
+use std::sync::Arc;
 
 /// Configured dummy provider instance used to exercise runtime plumbing end-to-end.
 #[derive(Clone, Debug)]
 pub struct DummyProvider {
-    /// Deterministic test identities published by this provider instance.
-    identities: Vec<PrivateKey>,
+    /// Deterministic test identities published by this provider instance as one shared snapshot.
+    identities: KeyPairSnapshot,
 }
 
 #[async_trait]
 impl KeyPairProvider for DummyProvider {
-    async fn load(&self) -> Result<Vec<PrivateKey>, anyhow::Error> {
-        Ok(self.identities.clone())
+    async fn load(&self) -> Result<KeyPairSnapshot, anyhow::Error> {
+        Ok(Arc::clone(&self.identities))
     }
 }
 
@@ -68,7 +69,9 @@ impl TryFrom<DummyProviderConfig> for DummyProvider {
 
         Ok(Self {
             // A fixed seed keeps tests and local manual verification stable across restarts.
-            identities: vec![PrivateKey::from(Ed25519Keypair::from_seed(&[7_u8; 32]))],
+            identities: Arc::<[Arc<PrivateKey>]>::from([Arc::new(PrivateKey::from(Ed25519Keypair::from_seed(
+                &[7_u8; 32],
+            )))]),
         })
     }
 }

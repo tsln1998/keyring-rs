@@ -5,7 +5,6 @@
 //! next caller refreshes it lazily.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
@@ -29,34 +28,34 @@ use tokio::sync::RwLock;
 ///     let calls = Arc::new(AtomicUsize::new(0));
 ///
 ///     let first = cache
-///         .get_or_init(Duration::from_secs(60), {
+///         .get_or_try_init(Duration::from_secs(60), {
 ///             let calls = Arc::clone(&calls);
 ///             move || async move {
 ///                 calls.fetch_add(1, Ordering::SeqCst);
-///                 "value".to_owned()
+///                 Ok::<_, std::convert::Infallible>("value".to_owned())
 ///             }
 ///         })
 ///         .await;
 ///
 ///     let second = cache
-///         .get_or_init(Duration::from_secs(60), {
+///         .get_or_try_init(Duration::from_secs(60), {
 ///             let calls = Arc::clone(&calls);
 ///             move || async move {
 ///                 calls.fetch_add(1, Ordering::SeqCst);
-///                 "fresh-value".to_owned()
+///                 Ok::<_, std::convert::Infallible>("fresh-value".to_owned())
 ///             }
 ///         })
 ///         .await;
 ///
-///     assert_eq!(first, "value");
-///     assert_eq!(second, "value");
+///     assert_eq!(first.unwrap(), "value");
+///     assert_eq!(second.unwrap(), "value");
 ///     assert_eq!(calls.load(Ordering::SeqCst), 1);
 /// });
 /// ```
 #[derive(Debug, Default)]
 pub struct CacheCell<T> {
     /// Cached value plus the timestamp recorded when that value was last refreshed.
-    inner: Arc<RwLock<Option<(T, Instant)>>>,
+    inner: RwLock<Option<(T, Instant)>>,
 }
 
 impl<T: Clone> CacheCell<T> {

@@ -29,6 +29,8 @@ pub(crate) struct BitwardenSession {
     keystore: KeyStore<BitwardenKeyIds>,
     /// Mutable authentication state guarded across concurrent load calls.
     auth: Mutex<BitwardenSessionAuthState>,
+    /// Serializes token refresh attempts without blocking already authenticated `/sync` calls.
+    refresh: Mutex<()>,
 }
 
 /// Mutable authentication state that changes as tokens are renewed.
@@ -53,8 +55,8 @@ impl BitwardenSession {
 
         info!(
             provider = %config.name,
-            api_url = %config.api_url,
-            identity_url = %config.identity_url,
+            api = %config.api_url,
+            identity = %config.identity_url,
             "creating bitwarden session"
         );
 
@@ -63,6 +65,7 @@ impl BitwardenSession {
             identity_config,
             keystore: KeyStore::default(),
             auth: Mutex::default(),
+            refresh: Mutex::default(),
         }
     }
 
@@ -72,17 +75,11 @@ impl BitwardenSession {
 
     /// Refreshes organization shared keys from the latest sync profile.
     pub(crate) fn initialize_org_keys(&self, profile: &BitwardenProfile) -> Result<()> {
-        debug!(
-            organization_count = profile.organizations.as_ref().map_or(0, Vec::len),
-            "initializing bitwarden organization keys"
-        );
+        debug!("initializing bitwarden organization keys");
         initialize_org_keys(&self.keystore, profile)
     }
 
-    pub(crate) async fn sync(
-        &self,
-        config: &BitwardenProviderConfig,
-    ) -> Result<BitwardenSyncResponse> {
+    pub(crate) async fn sync(&self, config: &BitwardenProviderConfig) -> Result<BitwardenSyncResponse> {
         // Step 1: ensure the bearer token is present and fresh enough for `/sync`.
         self.ensure_token(config).await?;
 
@@ -125,14 +122,13 @@ impl BitwardenSession {
 
         let status = response.status();
         let body = response
-            .text()
+            .bytes()
             .await
             .map_err(|error| anyhow!("bitwarden sync failed: {error}"))?;
 
         debug!(
             provider = %config.name,
             %status,
-            body_len = body.len(),
             "received bitwarden sync response"
         );
 
@@ -140,62 +136,55 @@ impl BitwardenSession {
             warn!(
                 provider = %config.name,
                 %status,
-                body_preview = %truncate_for_log(&body),
                 "bitwarden sync request failed"
             );
-            return Err(anyhow!(
-                "bitwarden sync failed with status {status}: {body}"
-            ));
+            return Err(anyhow!("bitwarden sync failed with status {status}"));
         }
 
         // Step 5: deserialize only after the HTTP layer has succeeded so parse errors remain easy
         // to distinguish from transport or authorization problems.
-        serde_json::from_str(&body).map_err(|error| {
+        serde_json::from_slice(&body).map_err(|error| {
             warn!(
                 provider = %config.name,
                 error = %error,
-                body_preview = %truncate_for_log(&body),
                 "failed to parse bitwarden sync response"
             );
             anyhow!("bitwarden sync failed: error in serde: {error}")
         })
     }
 
-    async fn ensure_token(
-        &self,
-        config: &BitwardenProviderConfig,
-    ) -> Result<(), BitwardenAuthError> {
-        // This quick lock only decides whether a refresh is needed. The actual authentication call
-        // happens after the lock is dropped so slow network I/O does not block readers.
-        let should_authenticate = {
-            let state = self.auth.lock().await;
-            match state.expires_at {
-                None => true,
-                Some(expires_at) => Instant::now() + TOKEN_RENEWAL_WINDOW >= expires_at,
-            }
-        };
+    async fn ensure_token(&self, config: &BitwardenProviderConfig) -> Result<(), BitwardenAuthError> {
+        // Fast path: authenticated callers should not queue behind a refresh mutex.
+        let should_authenticate = self.should_authenticate().await;
 
-        debug!(provider = %config.name, should_authenticate, "checked bitwarden token freshness");
-        if should_authenticate {
+        debug!(provider = %config.name, refresh = should_authenticate, "checked bitwarden token freshness");
+        if !should_authenticate {
+            return Ok(());
+        }
+
+        // Only one task should perform the network login. Re-check freshness after acquiring this
+        // lock because another waiter may have refreshed the token while this task was queued.
+        let _refresh = self.refresh.lock().await;
+        if self.should_authenticate().await {
             self.authenticate(config).await?;
         }
 
         Ok(())
     }
 
-    async fn authenticate(
-        &self,
-        config: &BitwardenProviderConfig,
-    ) -> Result<(), BitwardenAuthError> {
+    async fn should_authenticate(&self) -> bool {
+        let state = self.auth.lock().await;
+        match state.expires_at {
+            None => true,
+            Some(expires_at) => Instant::now() + TOKEN_RENEWAL_WINDOW >= expires_at,
+        }
+    }
+
+    async fn authenticate(&self, config: &BitwardenProviderConfig) -> Result<(), BitwardenAuthError> {
         info!(provider = %config.name, "authenticating bitwarden session");
 
         // First obtain a new bearer token and the crypto bootstrap fields tied to that login.
-        let response = request_api_key_token(
-            &self.identity_config,
-            &config.client_id,
-            &config.client_secret,
-        )
-        .await?;
+        let response = request_api_key_token(&self.identity_config, &config.client_id, &config.client_secret).await?;
 
         // Record the latest token before crypto initialization so later steps operate on the same
         // authenticated session state.
@@ -208,16 +197,15 @@ impl BitwardenSession {
 
         debug!(
             provider = %config.name,
-            expires_in = response.expires_in,
-            should_initialize_crypto,
+            ttl = response.expires_in,
+            crypto = should_initialize_crypto,
             "updated bitwarden auth state"
         );
 
         if should_initialize_crypto {
             // Crypto bootstrap is only required once per provider lifetime because the keystore is
             // retained across token renewals.
-            if let Err(error) = initialize_user_crypto(&self.keystore, &config.password, &response)
-            {
+            if let Err(error) = initialize_user_crypto(&self.keystore, &config.password, &response) {
                 // Roll the token state back when the crypto side fails so the next load does not
                 // observe an authenticated-but-unusable session.
                 let mut state = self.auth.lock().await;
@@ -235,18 +223,4 @@ impl BitwardenSession {
 
         Ok(())
     }
-}
-
-/// Truncates server response bodies before including them in logs.
-fn truncate_for_log(body: &str) -> String {
-    const MAX_CHARS: usize = 256;
-
-    if body.chars().count() <= MAX_CHARS {
-        return body.to_owned();
-    }
-
-    // Keep enough prefix to diagnose API errors without dumping large encrypted payloads into logs.
-    let mut preview = body.chars().take(MAX_CHARS).collect::<String>();
-    preview.push_str("...");
-    preview
 }

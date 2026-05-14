@@ -39,6 +39,9 @@ use ssh_agent_lib::codec::Codec;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::Request;
 use ssh_agent_lib::proto::Response;
+use std::time::Duration;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info};
 
@@ -64,7 +67,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        if !serve(&mut socket, config).await? {
+        if serve(&mut socket, config).await? {
             info!("shutdown requested");
             break;
         }
@@ -78,6 +81,10 @@ async fn serve<S>(socket: &mut S, config: Config) -> Result<bool>
 where
     S: ListeningSocket + fmt::Debug + Send,
 {
+    // `true` means the outer loop should stop after this generation; `false` means rebuild the
+    // config and start serving a fresh generation on the same bound listener.
+    let shutdown;
+
     let mut agent = ServiceAgent::new(match config.providers() {
         Ok(providers) => providers,
         Err(error) => {
@@ -86,21 +93,29 @@ where
         }
     })?;
 
+    // Keep spawned client tasks in a local join set so this generation can drain them before the
+    // next reload or final shutdown returns control to `main`.
+    let mut spawner = JoinSet::<Result<_, _>>::new();
+
     loop {
         let signal = Signal::default();
 
         tokio::select! {
             () = signal.user_defined1() => {
                 info!("received reload signal");
-                return Ok(true)
+                shutdown = false;
+                break;
             }
 
             () = signal.interrupt() => {
                 info!("received shutdown signal");
-                return Ok(false)
+                shutdown = true;
+                break;
             }
 
             accepted = socket.accept() => {
+                // Accepting happens on the generation task, while request handling is delegated to
+                // one spawned task per client connection.
                 let socket = match accepted {
                     Ok(socket) => {
                         debug!("accepted client connection");
@@ -113,8 +128,9 @@ where
                 };
 
                 // Each accepted Unix stream receives its own agent session so key caching stays
-                // scoped to the lifetime of that client connection.
-                tokio::spawn({
+                // scoped to the lifetime of that client connection. The outer timeout bounds how
+                // long this generation waits for the spawned handler future to finish.
+                spawner.spawn(timeout(Duration::from_secs(30), {
                     let session = <ServiceAgent as Agent<S>>::new_session(&mut agent, &socket);
                     async move {
                         if let Err(error) = handle::<S>(socket, session).await {
@@ -123,10 +139,42 @@ where
                             debug!("client session closed cleanly");
                         }
                     }
-                });
+                }));
+            }
+
+            joined = spawner.join_next(), if !spawner.is_empty() => {
+                if let Some(joined) = joined {
+                    // Surface both join failures and timeout wrappers immediately so the current
+                    // service generation does not silently drop handler failures.
+                    joined
+                        .map_err(|error| {
+                            error!(error = ?error, "failed to handle client connection");
+                            error
+                        })?
+                        .map_err(|error| {
+                            error!(error = ?error, "timeout when handle client connection");
+                            error
+                        })?;
+                }
             }
         }
     }
+
+    // Drain the remaining spawned handlers before finishing this generation so reload/shutdown
+    // observes a quiescent task set.
+    while let Some(joined) = spawner.join_next().await {
+        joined
+            .map_err(|error| {
+                error!(error = ?error, "failed to handle client connection");
+                error
+            })?
+            .map_err(|error| {
+                error!(error = ?error, "timeout when handle client connection");
+                error
+            })?;
+    }
+
+    Ok(shutdown)
 }
 
 /// Serves one connected ssh-agent client until disconnect or protocol failure.
