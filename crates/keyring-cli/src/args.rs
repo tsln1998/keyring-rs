@@ -23,11 +23,7 @@ use std::path::PathBuf;
 
 /// Process arguments accepted by the `keyring` binary.
 #[derive(Debug, Parser, Eq, PartialEq)]
-#[command(
-    name = "keyring",
-    arg_required_else_help = true,
-    disable_help_subcommand = true
-)]
+#[command(name = "keyring", arg_required_else_help = true, disable_help_subcommand = true)]
 pub struct Args {
     /// Path to the TOML configuration document that declares providers.
     #[arg(short, long, value_name = "CONFIG")]

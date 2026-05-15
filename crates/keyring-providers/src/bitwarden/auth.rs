@@ -157,40 +157,38 @@ pub(crate) async fn request_api_key_token(
 ) -> Result<BitwardenTokenSuccessResponse, BitwardenAuthError> {
     debug!(url = %config.base_path, client = client_id, "requesting bitwarden api-key token");
 
-    let request = BitwardenApiTokenRequest::new(client_id, client_secret);
+    let form = BitwardenApiTokenRequest::new(client_id, client_secret);
 
     // Bitwarden expects a classic form post for API-key login rather than a JSON payload.
-    let mut builder = config
+    let mut req = config
         .client
         .post(format!("{}/connect/token", config.base_path))
         .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
         .header("accept", "application/json")
         .header("Device-Type", DEVICE_TYPE.to_string())
-        .form(&request);
+        .form(&form);
 
     if let Some(user_agent) = &config.user_agent {
-        builder = builder.header("user-agent", user_agent.clone());
+        req = req.header("user-agent", user_agent.clone());
     }
 
     // Transport failures are mapped first so callers can distinguish them from identity errors
     // reported by Bitwarden itself.
-    let response = builder
+    let body = req
         .send()
         .await
-        .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?;
-
-    // Read the full body before branching because the same payload may need to be interpreted as
-    // success, two-factor-required, or a structured identity error.
-    let body = response
+        .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?
+        // Read the full body before branching because the same payload may need to be interpreted
+        // as success, two-factor-required, or a structured identity error.
         .bytes()
         .await
         .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?;
 
     debug!("received bitwarden identity response");
-    parse_token_response(&body)
+    parse_token(&body)
 }
 
-fn parse_token_response(body: &[u8]) -> Result<BitwardenTokenSuccessResponse, BitwardenAuthError> {
+fn parse_token(body: &[u8]) -> Result<BitwardenTokenSuccessResponse, BitwardenAuthError> {
     // Parse the payload once so large error bodies do not pay multiple JSON allocations.
     let response: BitwardenTokenResponse = serde_json::from_slice(body).map_err(|_| {
         error!("bitwarden identity response could not be parsed");

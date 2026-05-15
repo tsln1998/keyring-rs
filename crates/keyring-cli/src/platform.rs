@@ -32,9 +32,7 @@ use windows::{
     Win32::{
         Foundation::{FALSE, HLOCAL, LocalFree},
         Security::{
-            Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorA, SDDL_REVISION_1,
-            },
+            Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorA, SDDL_REVISION_1},
             PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
         },
     },

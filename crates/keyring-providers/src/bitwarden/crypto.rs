@@ -8,8 +8,8 @@ use super::models::{BitwardenCipher, BitwardenProfile};
 use anyhow::{Context, Result, anyhow, bail};
 use bitwarden_api_api::models::{KdfType, MasterPasswordUnlockResponseModel};
 use bitwarden_crypto::{
-    Decryptable, EncString, Kdf, KeyStore, KeyStoreContext, MasterKey, SymmetricKeyAlgorithm,
-    UnsignedSharedKey, key_ids,
+    Decryptable, EncString, Kdf, KeyStore, KeyStoreContext, MasterKey, SymmetricKeyAlgorithm, UnsignedSharedKey,
+    key_ids,
 };
 use std::num::NonZeroU32;
 use uuid::Uuid;
@@ -104,10 +104,7 @@ pub(crate) fn initialize_user_crypto(
 }
 
 /// Imports organization shared keys from the latest sync profile.
-pub(crate) fn initialize_org_keys(
-    store: &KeyStore<BitwardenKeyIds>,
-    profile: &BitwardenProfile,
-) -> Result<()> {
+pub(crate) fn initialize_org_keys(store: &KeyStore<BitwardenKeyIds>, profile: &BitwardenProfile) -> Result<()> {
     // No organizations means there is nothing extra to import for this vault snapshot.
     let organizations = profile.organizations.as_deref().unwrap_or(&[]);
     if organizations.is_empty() {
@@ -152,20 +149,13 @@ pub(crate) fn resolve_cipher_key(
 ) -> Result<BitwardenSymmetricKeyId> {
     // Start from the broadest key scope: organization items use the org key, personal items use
     // the user key.
-    let base_key = cipher.organization_id.map_or(
-        BitwardenSymmetricKeyId::User,
-        BitwardenSymmetricKeyId::Organization,
-    );
+    let base_key = cipher
+        .organization_id
+        .map_or(BitwardenSymmetricKeyId::User, BitwardenSymmetricKeyId::Organization);
 
     // Some Bitwarden items are wrapped again with an item-specific symmetric key.
-    let key_id = if let Some(key) = cipher
-        .key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let wrapped: EncString = key
-            .parse()
-            .context("failed to parse bitwarden cipher key")?;
+    let key_id = if let Some(key) = cipher.key.as_deref().filter(|value| !value.trim().is_empty()) {
+        let wrapped: EncString = key.parse().context("failed to parse bitwarden cipher key")?;
         ctx.unwrap_symmetric_key(base_key, &wrapped)
             .context("failed to unwrap bitwarden cipher key")?
     } else {
@@ -192,14 +182,9 @@ pub(crate) fn decrypt_optional_string(
         return Ok(None);
     };
 
-    let encrypted: EncString = value
-        .parse()
-        .context("failed to parse bitwarden enc string")?;
+    let encrypted: EncString = value.parse().context("failed to parse bitwarden enc string")?;
 
-    encrypted
-        .decrypt(ctx, key)
-        .map(Some)
-        .map_err(|error| anyhow!(error))
+    encrypted.decrypt(ctx, key).map(Some).map_err(|error| anyhow!(error))
 }
 
 /// Converts Bitwarden's unlock payload into the narrower crypto parameters used locally.

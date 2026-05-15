@@ -64,8 +64,7 @@ impl Config {
     /// Returns an error when the file cannot be read or when the TOML payload fails validation.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let source = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config {}", path.display()))?;
+        let source = fs::read_to_string(path).with_context(|| format!("failed to read config {}", path.display()))?;
         let deserializer = toml::de::Deserializer::new(&source);
         serde_path_to_error::deserialize(deserializer)
             .with_context(|| format!("failed to parse config {}", path.display()))
@@ -77,18 +76,12 @@ impl Config {
     ///
     /// Returns the first provider-construction error encountered while walking the config.
     pub fn providers(self) -> Result<Vec<Box<dyn KeyPairProvider>>> {
-        let mut providers =
-            Vec::with_capacity(self.dummy.len().saturating_add(self.bitwarden.len()));
-
-        for config in self.dummy {
-            providers.push(Box::new(DummyProvider::try_from(config)?) as Box<dyn KeyPairProvider>);
-        }
-
-        for config in self.bitwarden {
-            providers
-                .push(Box::new(BitwardenProvider::try_from(config)?) as Box<dyn KeyPairProvider>);
-        }
-
-        Ok(providers)
+        self.dummy
+            .into_iter()
+            .map(|cfg| DummyProvider::try_from(cfg).map(|provider| Box::new(provider) as Box<dyn KeyPairProvider>))
+            .chain(self.bitwarden.into_iter().map(|cfg| {
+                BitwardenProvider::try_from(cfg).map(|provider| Box::new(provider) as Box<dyn KeyPairProvider>)
+            }))
+            .collect()
     }
 }

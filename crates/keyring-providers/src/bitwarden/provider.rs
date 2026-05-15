@@ -128,54 +128,47 @@ impl BitwardenProvider {
         info!(provider = %self.config.name, "starting bitwarden fetch cycle");
 
         // Step 1: create or reuse the local Bitwarden session for this provider instance.
-        let session = self
+        let sess = self
             .session
             .get_or_init(|| async { BitwardenSession::new(&self.config) })
             .await;
 
         // Step 2: fetch the latest vault snapshot.
-        let response = session.sync(&self.config).await?;
+        let sync = sess.sync(&self.config).await?;
 
         // Step 3: refresh organization keys before attempting to decrypt any item payloads.
-        let profile = response
+        let profile = sync
             .profile
             .as_deref()
             .context("bitwarden sync response missing profile")?;
-        session.initialize_org_keys(profile)?;
+        sess.init_orgs(profile)?;
 
         // Step 4: walk the synchronized ciphers and keep only usable SSH private keys.
-        let keys = self.discover(response.ciphers.as_deref().unwrap_or(&[]), session.keystore());
+        let ciphers = sync.ciphers.as_deref().unwrap_or(&[]);
+        debug!(provider = %self.config.name, count = ciphers.len(), "discovering bitwarden ssh keys");
+
         Ok(Arc::<[Arc<PrivateKey>]>::from(
-            keys.into_iter().map(Arc::new).collect::<Vec<_>>(),
+            ciphers
+                .iter()
+                .filter_map(|cipher| match Self::key(cipher, sess.store()) {
+                    Ok(Some(key)) => Some(Arc::new(key)),
+                    // Discovery failures are logged and skipped so one malformed vault entry does
+                    // not block unrelated SSH keys from being published.
+                    Ok(None) => {
+                        debug!(provider = %self.config.name, cipher = ?cipher.id, "skipping non-usable bitwarden cipher");
+                        None
+                    }
+                    Err(err) => {
+                        error!(provider = %self.config.name, cipher = ?cipher.id, error = %err, "failed to parse bitwarden cipher");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>(),
         ))
     }
 
-    /// Walks the synchronized cipher list and keeps only successfully parsed SSH private keys.
-    fn discover(&self, ciphers: &[BitwardenCipher], keystore: &KeyStore<BitwardenKeyIds>) -> Vec<PrivateKey> {
-        // Preserve source order for logs and debugging, while letting `parse` decide which entries
-        // are usable.
-        let mut keys = vec![];
-        debug!(provider = %self.config.name, count = ciphers.len(), "discovering bitwarden ssh keys");
-
-        for cipher in ciphers {
-            // Discovery failures are logged and skipped so one malformed vault entry does not
-            // block unrelated SSH keys from being published.
-            match Self::parse(cipher, keystore) {
-                Ok(Some(key)) => keys.push(key),
-                Ok(None) => {
-                    debug!(provider = %self.config.name, cipher = ?cipher.id, "skipping non-usable bitwarden cipher");
-                }
-                Err(err) => {
-                    error!(provider = %self.config.name, cipher = ?cipher.id, error = %err, "failed to parse bitwarden cipher");
-                }
-            }
-        }
-
-        keys
-    }
-
     /// Converts one synchronized Bitwarden cipher into an SSH private key when possible.
-    fn parse(cipher: &BitwardenCipher, keystore: &KeyStore<BitwardenKeyIds>) -> Result<Option<PrivateKey>> {
+    fn key(cipher: &BitwardenCipher, store: &KeyStore<BitwardenKeyIds>) -> Result<Option<PrivateKey>> {
         // Guard clause group 1: only live SSH-key ciphers can produce identities.
         if !cipher.is_ssh_key() {
             trace!(cipher = ?cipher.id, kind = ?cipher.r#type, "skipping non-ssh bitwarden cipher");
@@ -192,40 +185,40 @@ impl BitwardenProvider {
         }
 
         // Guard clause group 2: the remaining steps require both an item id and an SSH-key payload.
-        let Some(cipher_id) = cipher.id else {
+        let Some(id) = cipher.id else {
             return Ok(None);
         };
 
-        let Some(ssh_key) = cipher.ssh_key.as_ref() else {
+        let Some(ssh) = cipher.ssh_key.as_ref() else {
             return Ok(None);
         };
 
         // Step 1: resolve the correct decryption key and decrypt the user-visible metadata plus
         // the OpenSSH private key text.
-        let mut ctx = keystore.context_mut();
-        let resolved_key = resolve_cipher_key(&mut ctx, cipher)?;
-        let decrypted_name = decrypt_optional_string(&mut ctx, resolved_key, cipher.name.as_deref())?;
-        let decrypted_private_key = decrypt_optional_string(&mut ctx, resolved_key, ssh_key.private_key.as_deref())?;
+        let mut ctx = store.context_mut();
+        let key = resolve_cipher_key(&mut ctx, cipher)?;
+        let name = decrypt_optional_string(&mut ctx, key, cipher.name.as_deref())?;
+        let pem = decrypt_optional_string(&mut ctx, key, ssh.private_key.as_deref())?;
 
         // Missing private-key text means the cipher claims to be an SSH key but cannot currently
         // yield a usable identity.
-        let Some(private_key_text) = decrypted_private_key else {
+        let Some(pem) = pem else {
             return Ok(None);
         };
 
         // Step 2: choose a stable identity comment. A deterministic fallback keeps downstream
         // ordering stable even when the Bitwarden item name is blank.
-        let comment = decrypted_name
+        let comment = name
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .map_or_else(|| format!("bitwarden:{cipher_id}"), ToOwned::to_owned);
+            .map_or_else(|| format!("bitwarden:{id}"), ToOwned::to_owned);
 
         // Step 3: parse the OpenSSH private key into the runtime representation used by the agent.
-        let mut private_key = PrivateKey::from_openssh(&private_key_text)
-            .with_context(|| format!("failed to parse bitwarden ssh private key for cipher {cipher_id}"))?;
-        private_key.set_comment(comment);
+        let mut out = PrivateKey::from_openssh(&pem)
+            .with_context(|| format!("failed to parse bitwarden ssh private key for cipher {id}"))?;
+        out.set_comment(comment);
 
-        Ok(Some(private_key))
+        Ok(Some(out))
     }
 }

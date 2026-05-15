@@ -32,8 +32,8 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info};
 
-const EXTENSION_NAME_QUERY: &str = "query";
-const EXTENSION_NAME_SESSION_BIND: &str = "session-bind@openssh.com";
+const QUERY: &str = "query";
+const BIND: &str = "session-bind@openssh.com";
 
 /// SSH agent implementation that carries providers into each session.
 pub struct ServiceAgent {
@@ -50,12 +50,12 @@ struct ServiceSession {
     /// private key in O(1) time.
     keys: OnceCell<HashMap<KeyData, KeyPair>>,
     /// Accepted session-bind records for this agent connection.
-    bindings: Vec<ServiceBinding>,
+    binds: Vec<Bind>,
 }
 
-struct ServiceBinding {
+struct Bind {
     id: Vec<u8>,
-    forwarding: bool,
+    fwd: bool,
 }
 
 impl ServiceAgent {
@@ -77,12 +77,6 @@ impl ServiceAgent {
     }
 }
 
-impl ServiceBinding {
-    pub fn new(id: Vec<u8>, forwarding: bool) -> Self {
-        Self { id, forwarding }
-    }
-}
-
 impl<S> Agent<S> for ServiceAgent
 where
     S: ListeningSocket + fmt::Debug + Send,
@@ -92,7 +86,7 @@ where
         ServiceSession {
             providers: Arc::clone(&self.providers),
             keys: OnceCell::new(),
-            bindings: Vec::new(),
+            binds: Vec::new(),
         }
     }
 }
@@ -100,10 +94,7 @@ where
 #[ssh_agent_lib::async_trait]
 impl Session for ServiceSession {
     async fn request_identities(&mut self) -> Result<Vec<AgentIdentity>, AgentError> {
-        let keys = self
-            .load_once()
-            .await
-            .map_err(|error| AgentError::other(std::io::Error::other(format!("{error:#}"))))?;
+        let keys = self.load_once().await.map_err(other)?;
 
         // The agent protocol publishes only public key blobs plus comments; the private key data
         // remains cached inside the session for future signing requests. We sort by `KeyData`
@@ -121,51 +112,47 @@ impl Session for ServiceSession {
         Ok(identities)
     }
 
-    async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        debug!(flags = request.flags, len = request.data.len(), "sign request received");
+    async fn sign(&mut self, req: SignRequest) -> Result<Signature, AgentError> {
+        debug!(flags = req.flags, len = req.data.len(), "sign request received");
 
-        let keys = self
-            .load_once()
-            .await
-            .map_err(|error| AgentError::other(std::io::Error::other(format!("{error:#}"))))?;
+        let keys = self.load_once().await.map_err(other)?;
 
         // Clients refer to identities by their public key blob, so we resolve the request back
         // to the cached private key before signing.
-        let key = keys.get(&request.pubkey).ok_or_else(|| {
+        let key = keys.get(&req.pubkey).ok_or_else(|| {
             error!("sign request referenced unpublished public key");
             AgentError::other(std::io::Error::other(
                 "no published identity matched the requested public key blob",
             ))
         })?;
 
-        let signature = Self::sign(key.as_ref(), &request.data, request.flags)
-            .map_err(|error| AgentError::other(std::io::Error::other(format!("{error:#}"))))?;
+        let sig = Self::sig(key.as_ref(), &req.data, req.flags).map_err(other)?;
 
-        debug!(alg = %signature.algorithm().as_str(), "sign request completed");
-        Ok(signature)
+        debug!(alg = %sig.algorithm().as_str(), "sign request completed");
+        Ok(sig)
     }
 
-    async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
-        debug!(name = %extension.name, "agent extension request received");
+    async fn extension(&mut self, ext: Extension) -> Result<Option<Extension>, AgentError> {
+        debug!(name = %ext.name, "agent extension request received");
 
-        match extension.name.as_str() {
-            EXTENSION_NAME_QUERY => {
+        match ext.name.as_str() {
+            QUERY => {
                 // OpenSSH clients may probe extension support before using non-core messages.
-                let response = Extension::new_message(QueryResponse {
-                    extensions: vec![EXTENSION_NAME_QUERY.into(), EXTENSION_NAME_SESSION_BIND.into()],
+                let res = Extension::new_message(QueryResponse {
+                    extensions: vec![QUERY.into(), BIND.into()],
                 })
                 .map_err(AgentError::other)?;
                 debug!("reporting supported agent extensions");
-                Ok(Some(response))
+                Ok(Some(res))
             }
-            EXTENSION_NAME_SESSION_BIND => {
+            BIND => {
                 // Windows OpenSSH sends `session-bind@openssh.com` before the first sign request.
                 // Accepting it keeps parity with the built-in agent path and avoids failing the
                 // whole connection on an otherwise valid authentication flow.
-                let bind = extension
+                let bind = ext
                     .parse_message::<SessionBind>()
-                    .map_err(|error| {
-                        error!(error = ?error, "failed to parse session-bind extension");
+                    .map_err(|err| {
+                        error!(error = ?err, "failed to parse session-bind extension");
                         AgentError::ExtensionFailure
                     })
                     .and_then(|bind| {
@@ -175,30 +162,34 @@ impl Session for ServiceSession {
                         })
                     })
                     .and_then(|bind| {
-                        bind.verify_signature().map_err(|error| {
-                            error!(error = ?error, "session-bind signature verification failed");
+                        bind.verify_signature().map_err(|err| {
+                            error!(error = ?err, "session-bind signature verification failed");
                             AgentError::ExtensionFailure
                         })?;
                         Ok(bind)
                     })?;
 
-                if self.bindings.iter().any(|binding| binding.id == bind.session_id) {
+                let dup = self.binds.iter().any(|item| item.id == bind.session_id);
+                if dup {
                     error!("duplicate session-bind received for the same connection");
                     return Err(AgentError::ExtensionFailure);
                 }
 
-                if self.bindings.iter().any(|binding| !binding.forwarding) {
+                let locked = self.binds.iter().any(|item| !item.fwd);
+                if locked {
                     error!("refusing session-bind after the connection was already bound for authentication");
                     return Err(AgentError::ExtensionFailure);
                 }
 
-                self.bindings
-                    .push(ServiceBinding::new(bind.session_id, bind.is_forwarding));
+                self.binds.push(Bind {
+                    id: bind.session_id,
+                    fwd: bind.is_forwarding,
+                });
 
                 Ok(None)
             }
             _ => {
-                debug!(name = %extension.name, "unsupported agent extension");
+                debug!(name = %ext.name, "unsupported agent extension");
                 Err(AgentError::Failure)
             }
         }
@@ -220,7 +211,7 @@ impl std::fmt::Debug for ServiceSession {
             .debug_struct("ServiceSession")
             .field("loaded", &self.keys.initialized())
             .field("providers", &self.providers.len())
-            .field("bindings", &self.bindings.len())
+            .field("bindings", &self.binds.len())
             .finish()
     }
 }
@@ -241,27 +232,27 @@ impl ServiceSession {
     /// Pulls already-normalized key snapshots from every configured provider and indexes them by
     /// public key so later sign requests can avoid re-scanning the full snapshot.
     async fn load(&self) -> Result<HashMap<KeyData, KeyPair>> {
-        let mut keys = HashMap::new();
+        let mut out = HashMap::new();
 
-        for (index, provider) in self.providers.iter().enumerate() {
-            let loaded = provider
+        for (i, src) in self.providers.iter().enumerate() {
+            let keys = src
                 .load()
                 .await
-                .with_context(|| format!("provider load failed at index {index}"))?;
+                .with_context(|| format!("provider load failed at index {i}"))?;
 
-            info!(provider = index, count = loaded.len(), "provider returned keys");
+            info!(provider = i, count = keys.len(), "provider returned keys");
 
-            keys.extend(loaded.iter().map(|key| (KeyData::from(key.as_ref()), Arc::clone(key))));
+            out.extend(keys.iter().map(|key| (KeyData::from(key.as_ref()), Arc::clone(key))));
         }
 
-        info!(count = keys.len(), "assembled provider key index");
-        Ok(keys)
+        info!(count = out.len(), "assembled provider key index");
+        Ok(out)
     }
 
     /// Produces a protocol-compatible signature for the requested key and algorithm flags.
-    fn sign(key: &PrivateKey, payload: &[u8], flags: u32) -> Result<Signature> {
+    fn sig(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature> {
         match key.algorithm() {
-            Algorithm::Ed25519 => key.try_sign(payload).context("identity failed to sign"),
+            Algorithm::Ed25519 => key.try_sign(data).context("identity failed to sign"),
             Algorithm::Rsa { .. } => {
                 let hash = if flags & RSA_SHA2_256 != 0 {
                     HashAlg::Sha256
@@ -279,11 +270,11 @@ impl ServiceSession {
 
                 let signature = match hash {
                     HashAlg::Sha256 => RsaSigningKey::<Sha256>::new(key)
-                        .try_sign(payload)
+                        .try_sign(data)
                         .map(|signature| signature.to_vec())
                         .context("identity failed to sign"),
                     HashAlg::Sha512 => RsaSigningKey::<Sha512>::new(key)
-                        .try_sign(payload)
+                        .try_sign(data)
                         .map(|signature| signature.to_vec())
                         .context("identity failed to sign"),
                     _ => unreachable!(),
@@ -295,4 +286,8 @@ impl ServiceSession {
             _ => bail!("identity uses an unsupported key algorithm"),
         }
     }
+}
+
+fn other(err: impl fmt::Display) -> AgentError {
+    AgentError::other(std::io::Error::other(format!("{err:#}")))
 }
