@@ -16,7 +16,7 @@ in
       package = lib.mkOption {
         type = lib.types.package;
         default = defaultPackage;
-        defaultText = lib.literalExpression "inputs.keyring-rs.packages.${pkgs.system}.keyring-rs";
+        defaultText = lib.literalExpression "inputs.keyring-rs.packages.${pkgs.stdenv.hostPlatform.system}.keyring-rs";
         description = "Package that provides the `keyring-rs` executable.";
       };
 
