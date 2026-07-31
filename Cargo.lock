@@ -1472,6 +1472,7 @@ dependencies = [
  "keyring-core",
  "keyring-providers",
  "keyring-service",
+ "libc",
  "rustls-rustcrypto",
  "serde",
  "serde_path_to_error",

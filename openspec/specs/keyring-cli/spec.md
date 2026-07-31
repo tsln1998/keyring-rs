@@ -32,9 +32,17 @@ The `keyring-cli` crate SHALL complete configuration loading, tracing initializa
 ### Requirement: CLI-owned config and socket lifecycle
 The `keyring-cli` crate SHALL own the top-level TOML document, cross-provider static validation, the `--path` socket binding, and the signal-driven reload loop that rebuilds service state without a control RPC.
 
-#### Scenario: Restart after an unclean shutdown
-- **WHEN** the user starts the binary with a valid `--config` file and `--path`
-- **THEN** `keyring-cli` binds the requested Unix listener once and keeps that listener open across reloads
+#### Scenario: Reclaim a stale Unix socket
+- **WHEN** the requested path is an unchanged Unix socket whose connection probe is refused
+- **THEN** `keyring-cli` removes that stale socket and retries the bind once
+
+#### Scenario: Preserve an occupied or unsafe path
+- **WHEN** the requested path has a live listener, is not a Unix socket, changes during probing, or cannot be inspected conclusively
+- **THEN** `keyring-cli` fails the bind without removing the existing path
+
+#### Scenario: Keep the listener across reloads
+- **WHEN** the running process reloads its configuration
+- **THEN** `keyring-cli` keeps the original listener open instead of rebinding the socket path
 
 ### Requirement: Signal-driven config reload
 The `keyring-cli` crate SHALL treat the configuration file as the only supported control surface and SHALL reload that file only when the running process receives `SIGUSR1`.
@@ -42,6 +50,13 @@ The `keyring-cli` crate SHALL treat the configuration file as the only supported
 #### Scenario: Reload the config file without rebinding the socket
 - **WHEN** the running process receives `SIGUSR1`
 - **THEN** `keyring-cli` re-reads the current `--config` file, rebuilds the provider-backed service state, and keeps serving on the original `--path`
+
+### Requirement: Signal-driven graceful shutdown
+The `keyring-cli` crate SHALL treat `SIGINT` and `SIGTERM` as graceful shutdown requests on Unix so the foreground runtime can drain active work and release its owned socket path before exiting.
+
+#### Scenario: Stop a systemd-managed service
+- **WHEN** the running process receives `SIGTERM`
+- **THEN** `keyring-cli` exits successfully after removing its owned Unix socket path so the same path can be bound on the next start
 
 ### Requirement: Secret-safe operational logging
 The `keyring-cli` crate SHALL initialize logging from environment-driven tracing filters such as `RUST_LOG` and MUST NOT emit passwords, client secrets, decrypted private keys, or full remote response bodies in operational logs.

@@ -7,6 +7,7 @@
 use anyhow::Result;
 use ssh_agent_lib::agent::ListeningSocket;
 
+#[cfg(windows)]
 use core::future::pending;
 #[cfg(windows)]
 use std::ffi::{OsString, c_void};
@@ -17,7 +18,11 @@ use std::io;
 #[cfg(windows)]
 use std::mem::size_of;
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::time::Duration;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(windows)]
@@ -26,6 +31,10 @@ use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
+#[cfg(unix)]
+use tokio::time::timeout;
+#[cfg(unix)]
+use tracing::warn;
 use tracing::{debug, info};
 #[cfg(windows)]
 use windows::{
@@ -109,9 +118,23 @@ pub struct Listener {
     path: PathBuf,
 }
 
+/// Control event received by the foreground service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalEvent {
+    Reload,
+    Shutdown,
+}
+
+#[cfg(windows)]
 #[derive(Debug, Default)]
+pub struct Signal;
+
+#[cfg(unix)]
+#[derive(Debug)]
 pub struct Signal {
-    // no-op
+    reload: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
 }
 
 impl Listener {
@@ -121,7 +144,7 @@ impl Listener {
     ///
     /// Returns any bind error reported by the underlying named-pipe listener.
     #[cfg(windows)]
-    pub fn bind(path: &str) -> Result<Self> {
+    pub async fn bind(path: &str) -> Result<Self> {
         info!(path = %path, "binding windows named-pipe listener");
 
         let path = OsString::from(path);
@@ -152,16 +175,81 @@ impl Listener {
     ///
     /// # Errors
     ///
-    /// Returns any socket-bind error reported by the operating system.
+    /// Returns any socket-bind or stale-socket cleanup error reported by the operating system.
     #[cfg(unix)]
-    pub fn bind(path: &str) -> Result<Self> {
-        // A pre-existing socket path is treated as an error so the caller does not silently steal
-        // another process's advertised agent endpoint.
+    pub async fn bind(path: &str) -> Result<Self> {
         info!(path = %path, "binding unix socket listener");
-        Ok(Self {
-            inner: UnixListener::bind(path)?,
-            path: path.into(),
-        })
+
+        let path = PathBuf::from(path);
+        let inner = bind_unix(&path).await?;
+
+        Ok(Self { inner, path })
+    }
+}
+
+#[cfg(unix)]
+async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            if reclaim_stale_socket(path).await? {
+                UnixListener::bind(path)
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+async fn reclaim_stale_socket(path: &Path) -> io::Result<bool> {
+    let original = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            debug!(path = %path.display(), error = ?error, "failed to inspect occupied unix socket path");
+            return Ok(false);
+        }
+    };
+
+    match timeout(Duration::from_secs(1), UnixStream::connect(path)).await {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            return Ok(false);
+        }
+        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+        Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Ok(Err(error)) => {
+            debug!(path = %path.display(), error = ?error, "unix socket probe was inconclusive");
+            return Ok(false);
+        }
+        Err(error) => {
+            debug!(path = %path.display(), error = ?error, "unix socket probe timed out");
+            return Ok(false);
+        }
+    }
+
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            debug!(path = %path.display(), error = ?error, "failed to recheck stale unix socket path");
+            return Ok(false);
+        }
+    };
+
+    if !current.file_type().is_socket() || original.dev() != current.dev() || original.ino() != current.ino() {
+        debug!(path = %path.display(), "unix socket path changed during stale-socket probe");
+        return Ok(false);
+    }
+
+    warn!(path = %path.display(), "removing stale unix socket path");
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -202,30 +290,105 @@ impl Drop for Listener {
 
 #[cfg(windows)]
 impl Signal {
-    pub fn user_defined1(&self) -> impl Future<Output = ()> {
-        pending()
+    pub fn new() -> Result<Self> {
+        Ok(Self)
     }
 
-    pub fn interrupt(&self) -> impl Future<Output = ()> {
+    pub async fn recv(&mut self) -> SignalEvent {
         pending()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::Listener;
+    use anyhow::Result;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn reclaims_stale_socket_path() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("agent.sock");
+        let stale = StdUnixListener::bind(&path)?;
+        drop(stale);
+
+        let listener = Listener::bind(path.to_string_lossy().as_ref()).await?;
+        assert!(path.exists());
+        drop(listener);
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_active_socket_path() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("agent.sock");
+        let active = StdUnixListener::bind(&path)?;
+
+        assert!(Listener::bind(path.to_string_lossy().as_ref()).await.is_err());
+        let probe = StdUnixStream::connect(&path)?;
+        drop(probe);
+        drop(active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_regular_file_path() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("agent.sock");
+        fs::write(&path, "keep me")?;
+
+        assert!(Listener::bind(path.to_string_lossy().as_ref()).await.is_err());
+        assert_eq!(fs::read_to_string(&path)?, "keep me");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_symbolic_link_path() -> Result<()> {
+        let directory = tempdir()?;
+        let target = directory.path().join("target");
+        let path = directory.path().join("agent.sock");
+        fs::write(&target, "keep me")?;
+        symlink(&target, &path)?;
+
+        assert!(Listener::bind(path.to_string_lossy().as_ref()).await.is_err());
+        assert!(path.is_symlink());
+        assert_eq!(fs::read_to_string(&target)?, "keep me");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removes_owned_socket_path_on_drop() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("agent.sock");
+        let listener = Listener::bind(path.to_string_lossy().as_ref()).await?;
+        assert!(path.exists());
+
+        drop(listener);
+
+        assert!(!path.exists());
+        Ok(())
     }
 }
 
 #[cfg(unix)]
 impl Signal {
-    pub async fn user_defined1(&self) {
-        if let Ok(mut signal) = signal(SignalKind::user_defined1()) {
-            signal.recv().await;
-        } else {
-            pending::<()>().await;
-        }
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            reload: signal(SignalKind::user_defined1())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
     }
 
-    pub async fn interrupt(&self) {
-        if let Ok(mut signal) = signal(SignalKind::interrupt()) {
-            signal.recv().await;
-        } else {
-            pending::<()>().await;
+    pub async fn recv(&mut self) -> SignalEvent {
+        tokio::select! {
+            _ = self.reload.recv() => SignalEvent::Reload,
+            _ = self.interrupt.recv() => SignalEvent::Shutdown,
+            _ = self.terminate.recv() => SignalEvent::Shutdown,
         }
     }
 }

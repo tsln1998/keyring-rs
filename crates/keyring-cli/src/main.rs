@@ -31,6 +31,7 @@ use keyring_cli::config::Config;
 use keyring_cli::init::init;
 use keyring_cli::platform::Listener;
 use keyring_cli::platform::Signal;
+use keyring_cli::platform::SignalEvent;
 use keyring_service::runtime::ServiceAgent;
 use ssh_agent_lib::agent::Agent;
 use ssh_agent_lib::agent::ListeningSocket;
@@ -55,8 +56,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     info!(config = %args.config.display(), path = %args.path, "starting keyring foreground service");
 
+    let mut signal = Signal::new()?;
+
     // The socket path is supplied explicitly rather than derived from the config document.
-    let mut socket = Listener::bind(&args.path)?;
+    let mut socket = Listener::bind(&args.path).await?;
     info!(path = %args.path, "listener bound successfully");
 
     loop {
@@ -64,7 +67,7 @@ async fn main() -> Result<()> {
         // always read from disk again before the new loop starts serving traffic.
         let config = load(&args.config)?;
 
-        if serve(&mut socket, config).await? {
+        if serve(&mut socket, &mut signal, config).await? {
             info!("shutdown requested");
             break;
         }
@@ -74,7 +77,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 /// Runs one service generation until a reload or shutdown signal arrives.
-async fn serve<S>(socket: &mut S, config: Config) -> Result<bool>
+async fn serve<S>(socket: &mut S, signal: &mut Signal, config: Config) -> Result<bool>
 where
     S: ListeningSocket + fmt::Debug + Send,
 {
@@ -90,19 +93,20 @@ where
     // Keep spawned client tasks in a local join set so this generation can drain them before the
     // next reload or final shutdown returns control to `main`.
     let mut jobs = JoinSet::<Job>::new();
-    let signal = Signal::default();
 
     loop {
         tokio::select! {
-            () = signal.user_defined1() => {
-                info!("received reload signal");
-                shutdown = false;
-                break;
-            }
-
-            () = signal.interrupt() => {
-                info!("received shutdown signal");
-                shutdown = true;
+            event = signal.recv() => {
+                match event {
+                    SignalEvent::Reload => {
+                        info!("received reload signal");
+                        shutdown = false;
+                    }
+                    SignalEvent::Shutdown => {
+                        info!("received shutdown signal");
+                        shutdown = true;
+                    }
+                }
                 break;
             }
 

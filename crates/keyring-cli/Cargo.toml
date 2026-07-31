@@ -38,5 +38,8 @@ windows.workspace = true
 indoc.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true
