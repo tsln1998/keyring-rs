@@ -47,6 +47,8 @@ pub(crate) struct BitwardenCipher {
     pub(crate) name: Option<String>,
     #[serde(rename = "deletedDate", alias = "DeletedDate")]
     pub(crate) deleted_date: Option<String>,
+    #[serde(rename = "archivedDate", alias = "ArchivedDate")]
+    pub(crate) archived_date: Option<String>,
     #[serde(rename = "key", alias = "Key")]
     pub(crate) key: Option<String>,
     #[serde(rename = "sshKey", alias = "SshKey")]
@@ -58,6 +60,20 @@ impl BitwardenCipher {
     pub(crate) fn is_ssh_key(&self) -> bool {
         self.r#type == Some(CIPHER_TYPE_SSH_KEY)
     }
+
+    /// Returns whether Bitwarden has moved this cipher to the trash.
+    pub(crate) fn is_deleted(&self) -> bool {
+        has_non_blank_value(self.deleted_date.as_deref())
+    }
+
+    /// Returns whether Bitwarden has archived this cipher.
+    pub(crate) fn is_archived(&self) -> bool {
+        has_non_blank_value(self.archived_date.as_deref())
+    }
+}
+
+fn has_non_blank_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
 }
 
 /// SSH-key payload subset embedded inside a Bitwarden cipher.
@@ -65,4 +81,35 @@ impl BitwardenCipher {
 pub(crate) struct BitwardenCipherSshKey {
     #[serde(rename = "privateKey", alias = "PrivateKey")]
     pub(crate) private_key: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BitwardenCipher;
+
+    #[test]
+    fn deserializes_archived_date_field_spellings() -> Result<(), serde_json::Error> {
+        for json in [
+            r#"{"archivedDate":"2026-08-11T00:00:00Z"}"#,
+            r#"{"ArchivedDate":"2026-08-11T00:00:00Z"}"#,
+        ] {
+            let cipher: BitwardenCipher = serde_json::from_str(json)?;
+            assert_eq!(cipher.archived_date.as_deref(), Some("2026-08-11T00:00:00Z"));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn archived_state_requires_a_non_blank_date() -> Result<(), serde_json::Error> {
+        for json in [r#"{}"#, r#"{"archivedDate":null}"#, r#"{"archivedDate":"  "}"#] {
+            let cipher: BitwardenCipher = serde_json::from_str(json)?;
+            assert!(!cipher.is_archived());
+        }
+
+        let cipher: BitwardenCipher = serde_json::from_str(r#"{"archivedDate":"2026-08-11T00:00:00Z"}"#)?;
+        assert!(cipher.is_archived());
+
+        Ok(())
+    }
 }

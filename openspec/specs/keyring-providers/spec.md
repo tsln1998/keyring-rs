@@ -51,11 +51,15 @@ The `keyring-providers` crate SHALL keep secret-bearing provider config fields r
 - **THEN** the Bitwarden provider fails provider startup instead of returning partial identities
 
 ### Requirement: Bitwarden SSH key discovery
-The `keyring-providers` crate SHALL inspect `response.ciphers`, keep items whose type is `SshKey` and whose decrypted `sshKey.privateKey` payload is present, SHALL NOT discover identities by scanning custom fields, notes, or attachments, and SHALL retain only the sync fields needed for discovery.
+The `keyring-providers` crate SHALL inspect `response.ciphers`, keep items whose type is `SshKey`, whose `deletedDate` and `archivedDate` values are absent or blank, and whose decrypted `sshKey.privateKey` payload is present, SHALL NOT discover identities by scanning custom fields, notes, or attachments, and SHALL retain only the sync fields needed for discovery.
 
 #### Scenario: Discover an SSH key cipher from sync data
 - **WHEN** the sync response contains a cipher item with `type == SshKey` and a populated `sshKey.privateKey`
 - **THEN** the Bitwarden provider publishes that item as one loaded identity
+
+#### Scenario: Skip an archived SSH key cipher
+- **WHEN** the sync response contains an otherwise usable SSH key cipher with a non-empty `archivedDate`
+- **THEN** the Bitwarden provider excludes that cipher from the published identities without attempting to decrypt it
 
 ### Requirement: Bitwarden identity material derives from private keys
 The `keyring-providers` crate SHALL derive the published algorithm and public key from the decrypted private key and SHALL write the published identity comment onto that private key using decrypted `cipher.name` as the default value with a deterministic fallback when the name is empty.

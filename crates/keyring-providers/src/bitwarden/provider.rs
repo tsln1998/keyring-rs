@@ -175,12 +175,13 @@ impl BitwardenProvider {
             return Ok(None);
         }
 
-        if cipher
-            .deleted_date
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
+        if cipher.is_deleted() {
             trace!(cipher = ?cipher.id, "skipping deleted bitwarden cipher");
+            return Ok(None);
+        }
+
+        if cipher.is_archived() {
+            trace!(cipher = ?cipher.id, "skipping archived bitwarden cipher");
             return Ok(None);
         }
 
@@ -220,5 +221,32 @@ impl BitwardenProvider {
         out.set_comment(comment);
 
         Ok(Some(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BitwardenProvider;
+    use crate::bitwarden::crypto::BitwardenKeyIds;
+    use crate::bitwarden::models::{BitwardenCipher, BitwardenCipherSshKey, CIPHER_TYPE_SSH_KEY};
+    use bitwarden_crypto::KeyStore;
+    use uuid::Uuid;
+
+    #[test]
+    fn archived_ssh_cipher_is_skipped_before_decryption() -> anyhow::Result<()> {
+        let cipher = BitwardenCipher {
+            id: Some(Uuid::nil()),
+            r#type: Some(CIPHER_TYPE_SSH_KEY),
+            archived_date: Some("2026-08-11T00:00:00Z".to_owned()),
+            ssh_key: Some(Box::new(BitwardenCipherSshKey {
+                private_key: Some("not-encrypted-key-material".to_owned()),
+            })),
+            ..BitwardenCipher::default()
+        };
+        let store = KeyStore::<BitwardenKeyIds>::default();
+
+        assert!(BitwardenProvider::key(&cipher, &store)?.is_none());
+
+        Ok(())
     }
 }
