@@ -43,9 +43,15 @@ rustPlatform.buildRustPackage {
   '';
 
   meta = with lib; {
-    description = "Configuration-driven Linux SSH agent service with pluggable key providers";
+    description = "Configuration-driven SSH agent service with pluggable key providers";
+    homepage = "https://github.com/tsln1998/keyring-rs";
     license = licenses.mit;
     mainProgram = "keyring-rs";
-    platforms = platforms.linux;
+    platforms = [
+      "x86_64-linux"
+      "aarch64-linux"
+      "x86_64-darwin"
+      "aarch64-darwin"
+    ];
   };
 }

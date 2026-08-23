@@ -1,9 +1,9 @@
 {
-  description = "keyring-rs: configuration-driven Linux SSH agent service";
+  description = "keyring-rs: configuration-driven SSH agent service";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    systems.url = "github:nix-systems/triplet";
+    systems.url = "github:nix-systems/default";
     flake-utils.url = "github:numtide/flake-utils";
     flake-utils.inputs.systems.follows = "systems";
     treefmt-nix.url = "github:numtide/treefmt-nix";
@@ -26,18 +26,21 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         treefmtEval = treefmt-nix.lib.evalModule pkgs ./formatter.nix;
-        package = pkgs.callPackage ./nix/packages/keyring-rs.nix { };
+        sourcePackage = pkgs.callPackage ./nix/packages/keyring-rs.nix { };
+        binaryPackage = pkgs.callPackage ./nix/packages/keyring-rs-bin.nix { };
       in
       {
-        packages = {
-          keyring-rs = package;
-          default = package;
+        packages = rec {
+          keyring-rs = sourcePackage;
+          keyring-rs-bin = binaryPackage;
+          default = keyring-rs-bin;
         };
 
         formatter = treefmtEval.config.build.wrapper;
 
         checks = {
-          package = package;
+          package = sourcePackage;
+          package-bin = binaryPackage;
           formatting = treefmtEval.config.build.check self;
         };
       }

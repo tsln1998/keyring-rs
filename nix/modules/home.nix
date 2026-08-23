@@ -9,7 +9,7 @@
 let
   common = import ./common.nix {
     inherit lib pkgs;
-    defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}."keyring-rs";
+    defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   };
   cfg = config.services.keyring-rs;
   configFile = common.mkConfigFile "keyring-rs-user" cfg;

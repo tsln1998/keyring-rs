@@ -39,10 +39,10 @@ cargo run -p keyring-cli -- --config ./keyring-rs.toml --path /tmp/keyring-rs.so
 The workspace `cargo run` / `cargo build` flow is intended for local development on the current
 host. Distribution builds use the target-specific release workflow described below.
 
-Run it from the flake package:
+Run the latest released binary from the default flake package:
 
 ```bash
-nix run .#keyring-rs -- --config ./keyring-rs.toml --path /tmp/keyring-rs.sock
+nix run . -- --config ./keyring-rs.toml --path /tmp/keyring-rs.sock
 ```
 
 Bitwarden-backed setups use the same root document and add `[[bitwarden]]` entries:
@@ -61,17 +61,20 @@ password = "master-password"
 
 The flake exports:
 
-- `packages.<system>.keyring-rs`: the packaged service.
+- `packages.<system>.keyring-rs`: the service built from the current source tree.
+- `packages.<system>.keyring-rs-bin`: the latest packaged GitHub Release binary.
+- `packages.<system>.default`: an alias for `keyring-rs-bin`.
 - `formatter.<system>`: `treefmt` with `nixfmt`, `taplo`, and `rustfmt`.
 - `nixosModules.keyring-rs`: a NixOS module that manages a systemd system service named `keyring-rs`.
 - `homeModules.keyring-rs`: a Home Manager module that manages a systemd user service named `keyring-rs`.
 
-The Nix package and service modules currently target Linux. Standalone release archives are
-available for Linux and macOS.
+The Nix packages target Linux and macOS on x86_64 and arm64. The NixOS and Home Manager service
+modules target Linux systemd services.
 
 For local or Nix-managed builds:
 
-- Linux: `nix build .#keyring-rs` produces the Nix-managed package for the current system.
+- `nix build .` downloads and packages the latest released binary for the current system.
+- `nix build .#keyring-rs` builds the service from the current source tree.
 - Windows: `cargo xwin build --target x86_64-pc-windows-msvc --release` produces a single `.exe`
   with the MSVC CRT linked statically. The resulting binary still imports normal Windows system
   DLLs such as `KERNEL32.dll`, which is expected.
@@ -106,6 +109,10 @@ from GitHub, inspect it first and then remove the quarantine attribute explicitl
 xattr -d com.apple.quarantine ./keyring
 ```
 
+The Nix binary package is pinned independently to the latest published release because its four
+content hashes are only available after the release assets exist. Update its version and hashes in
+`nix/packages/keyring-rs-bin.nix` after publishing a new release.
+
 For local checkouts, prefer `git+file:///...` inputs or commands such as `nix build .#keyring-rs`.
 Plain `path:` inputs copy the entire working tree into the Nix store, including large build
 directories such as `target/`. If you need newly created files to be visible through a local Git
@@ -113,6 +120,7 @@ flake input, stage them with `git add` before building.
 
 ## NixOS
 
+The module uses `packages.<system>.default` (`keyring-rs-bin`) unless `package` is set explicitly.
 Import the flake module and configure `services.keyring-rs`. The module supports two ways to pass
 the service configuration:
 
