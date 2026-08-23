@@ -66,10 +66,11 @@ The flake exports:
 - `packages.<system>.default`: an alias for `keyring-rs-bin`.
 - `formatter.<system>`: `treefmt` with `nixfmt`, `taplo`, and `rustfmt`.
 - `nixosModules.keyring-rs`: a NixOS module that manages a systemd system service named `keyring-rs`.
-- `homeModules.keyring-rs`: a Home Manager module that manages a systemd user service named `keyring-rs`.
+- `homeModules.keyring-rs`: a Home Manager module that manages `keyring-rs` through systemd on
+  Linux or launchd on macOS.
 
-The Nix packages target Linux and macOS on x86_64 and arm64. The NixOS and Home Manager service
-modules target Linux systemd services.
+The Nix packages target Linux and macOS on x86_64 and arm64. The NixOS module manages a Linux
+system service, while the Home Manager module manages a Linux or macOS user service.
 
 For local or Nix-managed builds:
 
@@ -184,16 +185,21 @@ changing the bound socket path.
 
 ## Home Manager
 
-The Home Manager module exports the same `settings` and `settingsFile` interface, but it runs the
-service as a systemd user unit:
+The Home Manager module exports the same `settings` and `settingsFile` interface. It runs the
+service as a systemd user unit on Linux and a launchd LaunchAgent on macOS:
 
 ```nix
+{ config, pkgs, ... }:
 {
   imports = [ keyring-rs.homeModules.keyring-rs ];
 
   services.keyring-rs = {
     enable = true;
-    path = "${config.home.homeDirectory}/.local/state/keyring-rs/keyring.sock";
+    path =
+      if pkgs.stdenv.hostPlatform.isDarwin then
+        "${config.home.homeDirectory}/Library/Application Support/keyring-rs/keyring.sock"
+      else
+        "${config.home.homeDirectory}/.local/state/keyring-rs/keyring.sock";
     settings = {
       dummy = [
         { name = "local"; }
@@ -204,13 +210,25 @@ service as a systemd user unit:
 ```
 
 As with the NixOS module, `settings` is suitable only for non-secret data because it is rendered
-into the Nix store. Use `settingsFile` when the configuration includes credentials.
+into the Nix store. Use `settingsFile` when the configuration includes credentials. Both service
+implementations create the socket parent directory before starting and use the flake's default
+`keyring-rs-bin` package unless `package` is set explicitly.
 
-The user service exposes the same reload behavior through the corresponding user unit:
+On Linux, reload the corresponding systemd user unit:
 
 ```bash
 systemctl --user reload keyring-rs
 ```
+
+On macOS, Home Manager installs the LaunchAgent as
+`org.nix-community.home.keyring-rs`. Inspect it or send `SIGUSR1` to reload the configuration:
+
+```bash
+launchctl print gui/$(id -u)/org.nix-community.home.keyring-rs
+launchctl kill SIGUSR1 gui/$(id -u)/org.nix-community.home.keyring-rs
+```
+
+The LaunchAgent starts when loaded, runs as a background process, and restarts after failures.
 
 ## License
 
