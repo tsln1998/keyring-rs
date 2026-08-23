@@ -1,0 +1,247 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.89.0
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: >-
+          rustup toolchain install "$RUST_TOOLCHAIN"
+          --profile minimal
+          --component rustfmt
+
+      - name: Validate tag and package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_version="$({
+            cargo "+$RUST_TOOLCHAIN" metadata --locked --no-deps --format-version 1
+          } | jq -r '.packages[] | select(.name == "keyring-cli") | .version')"
+
+          if [[ -z "$package_version" ]]; then
+            echo "Could not determine the keyring-cli package version" >&2
+            exit 1
+          fi
+
+          expected_tag="v$package_version"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $package_version" >&2
+            exit 1
+          fi
+
+          if [[ "$package_version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check formatting
+        run: cargo "+$RUST_TOOLCHAIN" fmt --all -- --check
+
+      - name: Run workspace tests
+        run: cargo "+$RUST_TOOLCHAIN" test --workspace --locked
+
+  build:
+    name: Build ${{ matrix.os }} ${{ matrix.arch }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            os: linux
+            arch: x86_64
+            file-pattern: x86-64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            os: linux
+            arch: arm64
+            file-pattern: ARM aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            os: darwin
+            arch: x86_64
+            file-pattern: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            os: darwin
+            arch: arm64
+            file-pattern: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      ASSET_NAME: keyring-rs-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust target
+        run: >-
+          rustup toolchain install "$RUST_TOOLCHAIN"
+          --profile minimal
+          --target "$TARGET"
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ matrix.os }}" == "darwin" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+          fi
+
+          CARGO_PROFILE_RELEASE_STRIP=symbols \
+            cargo "+$RUST_TOOLCHAIN" build \
+              --locked \
+              --release \
+              --package keyring-cli \
+              --bin keyring \
+              --target "$TARGET"
+
+      - name: Verify release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="target/$TARGET/release/keyring"
+          test -x "$binary"
+          "$binary" --help >/dev/null
+
+          description="$(file "$binary")"
+          echo "$description"
+          if [[ "$description" != *"${{ matrix.file-pattern }}"* ]]; then
+            echo "Binary architecture does not match ${{ matrix.arch }}" >&2
+            exit 1
+          fi
+
+          if [[ "${{ matrix.os }}" == "linux" ]]; then
+            linkage="$(ldd "$binary" 2>&1 || true)"
+            echo "$linkage"
+            if [[ "$linkage" != *"statically linked"* && \
+                  "$linkage" != *"not a dynamic executable"* ]]; then
+              echo "Linux release binary is not statically linked" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          staging="$RUNNER_TEMP/$ASSET_NAME"
+          mkdir -p "$staging"
+          install -m 0755 "target/$TARGET/release/keyring" "$staging/keyring"
+          install -m 0644 README.md LICENSE "$staging/"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/$ASSET_NAME.tar.gz" "$ASSET_NAME"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ runner.temp }}/${{ env.ASSET_NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: keyring-rs-${{ github.ref_name }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected=(
+            "keyring-rs-$GITHUB_REF_NAME-linux-x86_64.tar.gz"
+            "keyring-rs-$GITHUB_REF_NAME-linux-arm64.tar.gz"
+            "keyring-rs-$GITHUB_REF_NAME-darwin-x86_64.tar.gz"
+            "keyring-rs-$GITHUB_REF_NAME-darwin-arm64.tar.gz"
+          )
+
+          for asset in "${expected[@]}"; do
+            test -f "dist/$asset" || {
+              echo "Missing release asset: $asset" >&2
+              exit 1
+            }
+          done
+
+          archive_count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)"
+          if [[ "$archive_count" -ne "${#expected[@]}" ]]; then
+            echo "Expected ${#expected[@]} archives, found $archive_count" >&2
+            exit 1
+          fi
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum ./*.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_args=(
+            "$GITHUB_REF_NAME"
+            ./dist/*.tar.gz
+            ./dist/SHA256SUMS
+            --verify-tag
+            --title "$GITHUB_REF_NAME"
+            --generate-notes
+          )
+
+          if [[ "$PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh release create "${release_args[@]}"

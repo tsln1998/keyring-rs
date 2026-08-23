@@ -1,8 +1,8 @@
 # keyring-rs
 
-`keyring-rs` is a configuration-driven Linux SSH agent service. It runs as one foreground
-process, listens on a Unix socket, implements the minimal OpenSSH agent surface needed for
-identity listing and signing, and routes those operations to pluggable key providers.
+`keyring-rs` is a configuration-driven SSH agent service. It runs as one foreground process,
+implements the minimal OpenSSH agent surface needed for identity listing and signing, and routes
+those operations to pluggable key providers.
 
 The workspace currently ships with two providers:
 
@@ -37,7 +37,7 @@ cargo run -p keyring-cli -- --config ./keyring-rs.toml --path /tmp/keyring-rs.so
 ```
 
 The workspace `cargo run` / `cargo build` flow is intended for local development on the current
-host. Distribution builds use the static targets described below.
+host. Distribution builds use the target-specific release workflow described below.
 
 Run it from the flake package:
 
@@ -66,15 +66,45 @@ The flake exports:
 - `nixosModules.keyring-rs`: a NixOS module that manages a systemd system service named `keyring-rs`.
 - `homeModules.keyring-rs`: a Home Manager module that manages a systemd user service named `keyring-rs`.
 
-Only Linux systems are packaged because the current service binds Unix sockets directly.
+The Nix package and service modules currently target Linux. Standalone release archives are
+available for Linux and macOS.
 
-For release artifacts:
+For local or Nix-managed builds:
 
-- Linux: `nix build .#keyring-rs` produces a static `musl` binary that can run on another Linux
-  machine without matching the builder's glibc.
+- Linux: `nix build .#keyring-rs` produces the Nix-managed package for the current system.
 - Windows: `cargo xwin build --target x86_64-pc-windows-msvc --release` produces a single `.exe`
   with the MSVC CRT linked statically. The resulting binary still imports normal Windows system
   DLLs such as `KERNEL32.dll`, which is expected.
+
+## Release artifacts
+
+Pushing a version tag such as `v0.2.0` publishes a GitHub Release containing the `keyring` binary
+for these targets:
+
+| Archive | Target |
+| --- | --- |
+| `keyring-rs-v0.2.0-linux-x86_64.tar.gz` | Linux x86_64, statically linked with musl |
+| `keyring-rs-v0.2.0-linux-arm64.tar.gz` | Linux arm64, statically linked with musl |
+| `keyring-rs-v0.2.0-darwin-x86_64.tar.gz` | macOS x86_64 |
+| `keyring-rs-v0.2.0-darwin-arm64.tar.gz` | macOS arm64 |
+
+Each archive contains `keyring`, this README, and the MIT license. Verify the downloaded files
+against the release's `SHA256SUMS` before extracting them:
+
+```bash
+# Linux x86_64
+grep 'linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check
+
+# macOS arm64
+grep 'darwin-arm64.tar.gz$' SHA256SUMS | shasum -a 256 --check
+```
+
+The macOS binaries are not signed or notarized. If Gatekeeper quarantines a binary downloaded
+from GitHub, inspect it first and then remove the quarantine attribute explicitly:
+
+```bash
+xattr -d com.apple.quarantine ./keyring
+```
 
 For local checkouts, prefer `git+file:///...` inputs or commands such as `nix build .#keyring-rs`.
 Plain `path:` inputs copy the entire working tree into the Nix store, including large build
