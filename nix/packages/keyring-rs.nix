@@ -12,7 +12,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "keyring-rs";
-  version = "0.1.1";
+  version = "0.1.2";
 
   # Keep the packaged source limited to the Rust workspace inputs so large local
   # directories such as `target/` never become part of the derivation input.

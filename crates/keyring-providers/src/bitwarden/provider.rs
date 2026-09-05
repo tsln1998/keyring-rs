@@ -128,10 +128,12 @@ impl BitwardenProvider {
         info!(provider = %self.config.name, "starting bitwarden fetch cycle");
 
         // Step 1: create or reuse the local Bitwarden session for this provider instance.
+        // Fallible initialization leaves the cell empty on HTTP-client construction failure so
+        // subsequent loads can retry; a successfully constructed session survives later sync errors.
         let sess = self
             .session
-            .get_or_init(|| async { BitwardenSession::new(&self.config) })
-            .await;
+            .get_or_try_init(|| async { BitwardenSession::new(&self.config) })
+            .await?;
 
         // Step 2: fetch the latest vault snapshot.
         let sync = sess.sync(&self.config).await?;

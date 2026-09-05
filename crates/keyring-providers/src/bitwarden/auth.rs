@@ -150,6 +150,9 @@ impl std::error::Error for BitwardenAuthError {
 }
 
 /// Performs the API-key token exchange against Bitwarden identity.
+///
+/// A token requires both a successful HTTP status and a valid success payload. Structured identity
+/// and two-factor errors are preserved even when the endpoint returns a non-success status.
 pub(crate) async fn request_api_key_token(
     config: &IdentityConfiguration,
     client_id: &str,
@@ -174,18 +177,27 @@ pub(crate) async fn request_api_key_token(
 
     // Transport failures are mapped first so callers can distinguish them from identity errors
     // reported by Bitwarden itself.
-    let body = req
+    let response = req
         .send()
         .await
-        .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?
-        // Read the full body before branching because the same payload may need to be interpreted
-        // as success, two-factor-required, or a structured identity error.
+        .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?;
+    let status = response.status();
+    // Error responses carry structured identity details too; read them within the client timeout
+    // before deciding whether to return a domain error or a generic HTTP failure.
+    let body = response
         .bytes()
         .await
         .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?;
 
-    debug!("received bitwarden identity response");
-    parse_token(&body)
+    debug!(%status, "received bitwarden identity response");
+    // Payload shape alone must never make a non-success HTTP response a successful login.
+    match parse_token(&body) {
+        result if status.is_success() => result,
+        Err(error @ (BitwardenAuthError::IdentityFail(_) | BitwardenAuthError::TwoFactorRequired)) => Err(error),
+        _ => Err(BitwardenAuthError::token_request(anyhow!(
+            "bitwarden identity request failed with status {status}"
+        ))),
+    }
 }
 
 fn parse_token(body: &[u8]) -> Result<BitwardenTokenSuccessResponse, BitwardenAuthError> {

@@ -17,6 +17,7 @@ use core::fmt;
 use itertools::Itertools;
 use keyring_core::provider::{KeyPair, KeyPairProvider};
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+use rsa::traits::PublicKeyParts;
 use sha2::{Sha256, Sha512};
 use signature::{SignatureEncoding, Signer};
 use ssh_agent_lib::agent::{Agent, ListeningSocket, Session};
@@ -34,6 +35,8 @@ use tracing::{debug, error, info};
 
 const QUERY: &str = "query";
 const BIND: &str = "session-bind@openssh.com";
+/// Preserves ssh-key's minimum RSA signing size when bypassing its private-key conversion.
+const RSA_MIN_BITS: usize = 2048;
 
 /// SSH agent implementation that carries providers into each session.
 pub struct ServiceAgent {
@@ -250,6 +253,9 @@ impl ServiceSession {
     }
 
     /// Produces a protocol-compatible signature for the requested key and algorithm flags.
+    ///
+    /// RSA requires an explicit SHA-2 flag, with SHA-256 taking precedence if both are set.
+    /// Private-component consistency and the existing minimum RSA size are checked before signing.
     fn sig(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature> {
         match key.algorithm() {
             Algorithm::Ed25519 => key.try_sign(data).context("identity failed to sign"),
@@ -261,12 +267,24 @@ impl ServiceSession {
                 } else {
                     bail!("identity only supports rsa-sha2-256 and rsa-sha2-512");
                 };
-                let key: rsa::RsaPrivateKey = key
-                    .key_data()
-                    .rsa()
-                    .context("identity is not an rsa key")?
-                    .try_into()
-                    .context("identity failed to prepare rsa signing")?;
+                let key = key.key_data().rsa().context("identity is not an rsa key")?;
+                // ssh-key 0.6.7's conversion incorrectly supplies p for both prime factors.
+                // Construct with p and q directly; rsa validates the components and recomputes CRT
+                // values instead of relying on the stored OpenSSH coefficient.
+                let key = rsa::RsaPrivateKey::from_components(
+                    rsa::BigUint::try_from(&key.public.n)?,
+                    rsa::BigUint::try_from(&key.public.e)?,
+                    rsa::BigUint::try_from(&key.private.d)?,
+                    vec![
+                        rsa::BigUint::try_from(&key.private.p)?,
+                        rsa::BigUint::try_from(&key.private.q)?,
+                    ],
+                )
+                .context("identity failed to prepare rsa signing")?;
+                // Match the bypassed conversion's byte-rounded size check as well as its minimum.
+                if key.size().saturating_mul(8) < RSA_MIN_BITS {
+                    bail!("identity rsa key is too small");
+                }
 
                 let signature = match hash {
                     HashAlg::Sha256 => RsaSigningKey::<Sha256>::new(key)

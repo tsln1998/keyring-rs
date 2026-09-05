@@ -23,6 +23,18 @@ The workspace currently ships with two providers:
 through `--path`. The service has no subcommands and no control RPC surface. When the running
 process receives `SIGUSR1`, it reloads the config file currently passed through `--config`.
 
+Reload builds and validates the new configuration locally while the current agent continues
+serving clients. Invalid configurations leave the current agent and its connections running.
+After a successful reload, new connections use the new configuration, idle old connections close,
+and old connections with a request in progress close after sending its response or reaching its
+original deadline. Bitwarden login and sync remain lazy, so a successful reload does not verify
+remote credentials. Repeated reload signals during a configuration build queue one further read.
+
+Idle client connections have no lifetime limit. Each fully decoded request gets a 30-second
+cooperative deadline covering provider loading, signing, and sending the response; an expired
+request closes only its own connection. `SIGINT` and `SIGTERM` stop accepting clients, close idle
+connections, and allow active requests to finish, with a 30-second cooperative shutdown deadline.
+
 A minimal local setup with the dummy provider looks like this:
 
 ```toml
@@ -56,6 +68,12 @@ client_id = "client-id"
 client_secret = "super-secret"
 password = "master-password"
 ```
+
+Bitwarden HTTP requests use a 5-second connection timeout, a 5-second per-read timeout, and a
+10-second total timeout. A `/sync` response with HTTP 401 triggers authentication recovery and
+one sync retry within the original agent request deadline. Other HTTP failures and transport
+timeouts fail the load without this retry. Successful key snapshots are cached for one hour;
+failed refreshes do not publish a new snapshot or return an expired snapshot as a fallback.
 
 ## Nix
 
