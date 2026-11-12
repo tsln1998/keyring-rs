@@ -26,8 +26,6 @@ stdenvNoCC.mkDerivation {
     runHook preInstall
 
     install -Dm755 keyring "$out/bin/keyring"
-    # Both executable names resolve to the same service and control commands.
-    ln -s keyring "$out/bin/keyring-rs"
     install -Dm644 README.md "$out/share/doc/keyring-rs/README.md"
     install -Dm644 LICENSE "$out/share/licenses/keyring-rs/LICENSE"
 
@@ -37,7 +35,7 @@ stdenvNoCC.mkDerivation {
   # Exercise argument parsing to catch an archive that cannot run on this platform.
   doInstallCheck = true;
   installCheckPhase = ''
-    "$out/bin/keyring-rs" --help >/dev/null
+    "$out/bin/keyring" --help >/dev/null
   '';
 
   meta = with lib; {

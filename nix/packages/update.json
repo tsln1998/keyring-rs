@@ -1,21 +1,21 @@
 {
   "platforms": {
     "aarch64-darwin": {
-      "hash": "sha256-jDgSF/pKleyVjQ43pQ2RQQsSnOkQq20lB646Q4bq52Q=",
-      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.1.2/keyring-rs-v0.1.2-darwin-arm64.tar.gz"
+      "hash": "sha256-friJsC7DMzpwIoaaC/1DHpISHE2hgVx20yhgAIl24Bk=",
+      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.2.0-alpha1/keyring-rs-v0.2.0-alpha1-darwin-arm64.tar.gz"
     },
     "aarch64-linux": {
-      "hash": "sha256-75cKpI8Y75RXe1QUL877MUCBMtC6PhZxnVW296QB/NE=",
-      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.1.2/keyring-rs-v0.1.2-linux-arm64.tar.gz"
+      "hash": "sha256-fPW0IjTgD+Lufv1ut6D8DhBodR5TWnAkRrDGk9V8fb8=",
+      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.2.0-alpha1/keyring-rs-v0.2.0-alpha1-linux-arm64.tar.gz"
     },
     "x86_64-darwin": {
-      "hash": "sha256-b5CzMvLXBKDbGwZV9ZzTIBGykZpUGptJZXl0n944eAc=",
-      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.1.2/keyring-rs-v0.1.2-darwin-x86_64.tar.gz"
+      "hash": "sha256-kGwmutm/dpXVbYJ2Ray5wQPc6u8MIuAwLDQEN57jdZA=",
+      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.2.0-alpha1/keyring-rs-v0.2.0-alpha1-darwin-x86_64.tar.gz"
     },
     "x86_64-linux": {
-      "hash": "sha256-osO+SH3G4ELT/lhdIwz0vGgwOGhJaUGO8fkkGNH1RGQ=",
-      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.1.2/keyring-rs-v0.1.2-linux-x86_64.tar.gz"
+      "hash": "sha256-BlqOAAHDZ6T/3lmuDGEp53bL1KYpABT7/4U9rK5izb8=",
+      "url": "https://github.com/tsln1998/keyring-rs/releases/download/v0.2.0-alpha1/keyring-rs-v0.2.0-alpha1-linux-x86_64.tar.gz"
     }
   },
-  "version": "0.1.2"
+  "version": "0.2.0-alpha1"
 }
