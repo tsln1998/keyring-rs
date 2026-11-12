@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Workspace dependencies
 anyhow.workspace = true
 bitwarden-api-api.workspace = true
 bitwarden-api-identity.workspace = true
@@ -22,6 +23,32 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+
+# Default features
+reqwest.default-features = false
+
+# Features
+reqwest.features = [
+  "form",
+  "query",
+  "rustls-no-provider",
+]
+serde.features = [
+  "derive",
+]
+ssh-key.features = [
+  "ed25519",
+  "rsa",
+]
+tokio.features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+]
+uuid.features = [
+  "serde",
+]
 
 [lints]
 workspace = true

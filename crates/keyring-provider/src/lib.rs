@@ -403,13 +403,21 @@ mod http_tests {
 
     /// Local password and unlock-metadata failures belong to authentication and must not download a vault.
     #[tokio::test]
-    async fn wrong_password_and_missing_unlock_data_fail_before_sync() -> Result<()> {
+    async fn invalid_unlock_inputs_fail_before_sync() -> Result<()> {
         let (token, _, _) = payload()?;
         let fixture = Fixture::new(vec![(200, token.clone())]).await?;
         assert!(matches!(
             load(fixture.config.clone(), password("wrong password")).await,
             Err(LoadError::Auth(_))
         ));
+        assert_eq!(fixture.requests().len(), 1);
+        let mut unknown_kdf = token.clone();
+        unknown_kdf["userDecryptionOptions"]["masterPasswordUnlock"]["kdf"]["kdfType"] = json!(999);
+        let fixture = Fixture::new(vec![(200, unknown_kdf)]).await?;
+        let Err(LoadError::Auth(error)) = load(fixture.config.clone(), password(PASSWORD)).await else {
+            anyhow::bail!("expected unsupported KDF authentication error");
+        };
+        assert!(format!("{error:#}").contains("unsupported bitwarden kdf"));
         assert_eq!(fixture.requests().len(), 1);
         // A successful token exchange is insufficient when the response omits local unlock inputs.
         let mut token = token;

@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Workspace dependencies
 anyhow.workspace = true
 keyring-core.workspace = true
 keyring-provider.workspace = true
@@ -19,9 +20,27 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# Features
+serde.features = [
+  "derive",
+]
+ssh-key.features = [
+  "ed25519",
+  "rsa",
+]
+time.features = [
+  "formatting",
+]
+tokio.features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+]
+
 [dev-dependencies]
+# Workspace dependencies
 keyring-store-memory.workspace = true
-rand.workspace = true
 signature.workspace = true
 
 [lints]

@@ -4,8 +4,10 @@
 //! zeroized on drop because unlock extensions contain the user's master password.
 
 use anyhow::{Context, Result, bail};
-use ssh_agent_lib::proto::{Request, Response};
-use ssh_encoding::{Decode, Encode, Reader};
+use ssh_agent_lib::{
+    proto::{Request, Response},
+    ssh_encoding::{Decode, Encode, Reader},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::{Zeroize, Zeroizing};
 

@@ -5,7 +5,7 @@
 
 use anyhow::anyhow;
 use bitwarden_api_api::models::MasterPasswordUnlockResponseModel;
-use bitwarden_api_identity::apis::configuration::Configuration as IdentityConfiguration;
+use bitwarden_api_identity::Configuration as IdentityConfiguration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -193,17 +193,13 @@ pub(crate) async fn request_api_key_token(
     let form = BitwardenApiTokenRequest::new(client_id, client_secret);
 
     // Bitwarden expects a classic form post for API-key login rather than a JSON payload.
-    let mut req = config
+    let req = config
         .client
         .post(format!("{}/connect/token", config.base_path))
         .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
         .header("accept", "application/json")
         .header("Device-Type", DEVICE_TYPE.to_string())
         .form(&form);
-
-    if let Some(user_agent) = &config.user_agent {
-        req = req.header("user-agent", user_agent.clone());
-    }
 
     // Transport failures are mapped first so callers can distinguish them from identity errors
     // reported by Bitwarden itself.

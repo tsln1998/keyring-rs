@@ -335,13 +335,13 @@ mod tests {
                     anyhow::bail!("identities missing");
                 };
                 assert_eq!(identities.len(), 1);
-                assert_eq!(identities[0].pubkey, key.public_key().key_data().clone());
+                assert_eq!(identities[0].credential.key_data(), key.public_key().key_data());
                 assert_eq!(identities[0].comment, "fixture key");
             }
             protocol::write(
                 &mut client,
                 &Request::SignRequest(SignRequest {
-                    pubkey: key.public_key().key_data().clone(),
+                    credential: key.public_key().key_data().clone().into(),
                     data: b"end-to-end signature".to_vec(),
                     flags: 0,
                 }),

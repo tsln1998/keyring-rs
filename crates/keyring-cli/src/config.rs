@@ -18,7 +18,8 @@ impl Config {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         // The source contains API credentials; wipe this owned text buffer when it is dropped.
         let source = Zeroizing::new(fs::read_to_string(path.as_ref()).context("failed to read configuration")?);
-        let deserializer = toml::de::Deserializer::new(&source);
+        let deserializer =
+            toml::de::Deserializer::parse(&source).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
         // Full parser errors can quote source fragments, so retain only the failing field path.
         let config: Self = serde_path_to_error::deserialize(deserializer)
             .map_err(|error| anyhow::anyhow!("invalid configuration at {}", error.path()))?;
@@ -49,11 +50,13 @@ mod tests {
     #[test]
     fn parse_errors_never_include_source_secrets() -> Result<()> {
         use std::io::Write;
-        let mut file = tempfile::NamedTempFile::new()?;
-        let source = VALID.replace("client_secret='secret'", "client_secret=['do-not-log-this']");
-        writeln!(file, "{source}")?;
-        let error = Config::new(file.path()).expect_err("client_secret must be a string");
-        assert!(!format!("{error:#?}").contains("do-not-log-this"));
+        for secret in ["['do-not-log-this']", "'do-not-log-this"] {
+            let mut file = tempfile::NamedTempFile::new()?;
+            let source = VALID.replace("client_secret='secret'", &format!("client_secret={secret}"));
+            writeln!(file, "{source}")?;
+            let error = Config::new(file.path()).expect_err("invalid client_secret must be rejected");
+            assert!(!format!("{error:#?}").contains("do-not-log-this"));
+        }
         Ok(())
     }
 }

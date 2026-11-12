@@ -21,7 +21,7 @@ use ssh_agent_lib::{
     agent::{Agent, ListeningSocket, Session},
     error::AgentError,
     proto::{
-        Extension, Identity, RSA_SHA2_256, RSA_SHA2_512, SignRequest,
+        Extension, Identity, PublicCredential, RSA_SHA2_256, RSA_SHA2_512, SignRequest,
         extension::{MessageExtension, QueryResponse, SessionBind},
     },
 };
@@ -473,7 +473,7 @@ impl Session for ServiceSession {
             .keys
             .iter()
             .map(|(identity, binding)| Identity {
-                pubkey: identity.clone(),
+                credential: identity.clone().into(),
                 comment: binding.record.comment.clone(),
             })
             .collect())
@@ -481,10 +481,13 @@ impl Session for ServiceSession {
 
     /// Dispatch signing to the selected backend without contacting the provider.
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
+        let PublicCredential::Key(identity) = &request.credential else {
+            return Err(AgentError::Failure);
+        };
         let binding = {
             let current = state(&self.agent.shared);
             self.check(&current)?;
-            current.keys.get(&request.pubkey).cloned().ok_or(AgentError::Failure)?
+            current.keys.get(identity).cloned().ok_or(AgentError::Failure)?
         };
         let algorithm = algorithm(&binding.record.spec, request.flags)?;
         let shared = Arc::clone(&self.agent.shared);
@@ -779,15 +782,18 @@ mod tests {
     /// Unsupported and failing platform stores both allow the memory fallback to win.
     #[test]
     fn priority_capabilities_and_failed_import_fall_back_to_memory() -> Result<()> {
-        let mut keychain = MockStore::new(StoreKind::Keychain);
-        keychain.supported = false;
-        let mut desktop = MockStore::new(StoreKind::FreeDesktop);
-        desktop.fail_load = true;
-        let memory = Arc::new(MemoryStore::default());
-        let agent = agent(vec![memory.clone(), Arc::new(desktop), Arc::new(keychain)])?;
-        publish(&agent, vec![material(1)?])?;
-        assert_eq!(agent.status().keys[0].store, StoreKind::Memory);
-        assert_eq!(memory.list()?.len(), 1);
+        for (available, supported) in [(false, true), (true, false)] {
+            let mut keychain = MockStore::new(StoreKind::Keychain);
+            keychain.available = available;
+            keychain.supported = supported;
+            let mut desktop = MockStore::new(StoreKind::FreeDesktop);
+            desktop.fail_load = true;
+            let memory = Arc::new(MemoryStore::default());
+            let agent = agent(vec![memory.clone(), Arc::new(desktop), Arc::new(keychain)])?;
+            publish(&agent, vec![material(1)?])?;
+            assert_eq!(agent.status().keys[0].store, StoreKind::Memory);
+            assert_eq!(memory.list()?.len(), 1);
+        }
         Ok(())
     }
 
@@ -849,20 +855,24 @@ mod tests {
         let mut session = agent.session();
         let keys = session.request_identities().await?;
         assert_eq!(keys.len(), 2);
-        assert!(keys[0].pubkey < keys[1].pubkey);
+        assert!(keys[0].credential.key_data() < keys[1].credential.key_data());
         let signature = session
             .sign(SignRequest {
-                pubkey: keys[0].pubkey.clone(),
+                credential: keys[0].credential.clone(),
                 data: b"hello".to_vec(),
                 flags: 0,
             })
             .await?;
-        signature::Verifier::verify(&ssh_key::PublicKey::from(keys[0].pubkey.clone()), b"hello", &signature)?;
+        signature::Verifier::verify(
+            &ssh_key::PublicKey::from(keys[0].credential.key_data().clone()),
+            b"hello",
+            &signature,
+        )?;
         // RSA-specific flags must still be rejected for an Ed25519 identity.
         assert!(
             session
                 .sign(SignRequest {
-                    pubkey: keys[0].pubkey.clone(),
+                    credential: keys[0].credential.clone(),
                     data: Vec::new(),
                     flags: RSA_SHA2_256
                 })
@@ -959,7 +969,7 @@ mod tests {
         let signing = tokio::spawn(async move {
             session
                 .sign(SignRequest {
-                    pubkey: identity.pubkey,
+                    credential: identity.credential,
                     data: b"request".to_vec(),
                     flags: 0,
                 })
@@ -1053,21 +1063,6 @@ mod tests {
         );
     }
 
-    /// Backend unavailability and algorithm rejection obey the same shared store contract.
-    #[test]
-    fn shared_contract_checks_unavailable_and_unsupported_stores() -> Result<()> {
-        for (available, supported) in [(false, true), (true, false)] {
-            let mut store = MockStore::new(StoreKind::Keychain);
-            store.available = available;
-            store.supported = supported;
-            keyring_store_memory::contract::run_store_contract(
-                &store,
-                &[PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]))],
-            )?;
-        }
-        Ok(())
-    }
-
     /// Each algorithm selects its own capable store and produces a verifiable signature.
     #[tokio::test]
     async fn mixed_algorithms_choose_their_own_stores_and_verify() -> Result<()> {
@@ -1079,7 +1074,10 @@ mod tests {
             Arc::new(desktop),
             Arc::new(MemoryStore::default()),
         ])?;
-        let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(&mut rand::rngs::OsRng, 2048)?);
+        let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(
+            &mut ssh_key::rand_core::OsRng,
+            2048,
+        )?);
         publish(&agent, vec![software::material(&rsa)?, material(8)?])?;
         let status = agent.status();
         assert_eq!(status.keys[0].store, StoreKind::Keychain);
@@ -1089,19 +1087,25 @@ mod tests {
         let mut session = agent.session();
         // Exercise protocol dispatch using the flags each key algorithm requires.
         for identity in session.request_identities().await? {
-            let flags = if identity.pubkey.algorithm().is_rsa() {
-                RSA_SHA2_512
+            let requested_flags: &[u32] = if identity.credential.key_data().algorithm().is_rsa() {
+                &[RSA_SHA2_256, RSA_SHA2_512]
             } else {
-                0
+                &[0]
             };
-            let signature = session
-                .sign(SignRequest {
-                    pubkey: identity.pubkey.clone(),
-                    data: b"mixed stores".to_vec(),
-                    flags,
-                })
-                .await?;
-            signature::Verifier::verify(&ssh_key::PublicKey::from(identity.pubkey), b"mixed stores", &signature)?;
+            for &flags in requested_flags {
+                let signature = session
+                    .sign(SignRequest {
+                        credential: identity.credential.clone(),
+                        data: b"mixed stores".to_vec(),
+                        flags,
+                    })
+                    .await?;
+                signature::Verifier::verify(
+                    &ssh_key::PublicKey::from(identity.credential.key_data().clone()),
+                    b"mixed stores",
+                    &signature,
+                )?;
+            }
         }
         Ok(())
     }

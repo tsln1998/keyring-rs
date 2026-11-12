@@ -356,25 +356,44 @@ impl Store for KeychainStore {
 
 #[cfg(test)]
 mod tests {
-    /// Checks the shared contract and Security.framework's RSA export restriction.
+    use super::*;
+    use ssh_key::{PrivateKey, Signature, private::Ed25519Keypair};
+
     #[test]
     #[ignore = "requires a real unlocked macOS Keychain; not verified in CI"]
-    fn platform_contract() -> Result<(), Box<dyn std::error::Error>> {
-        use keyring_core::Store;
-        let store = super::KeychainStore::new();
+    fn stored_keys_sign_and_rsa_is_not_extractable() -> Result<(), Box<dyn std::error::Error>> {
+        let store = KeychainStore::new();
         assert!(store.available());
-        let rsa = ssh_key::PrivateKey::from(ssh_key::private::RsaKeypair::random(&mut rand::rngs::OsRng, 2048)?);
-        keyring_store_memory::contract::run_store_contract(
-            &store,
-            &[keyring_store_memory::contract::ed25519_fixture(), rsa.clone()],
-        )?;
-        // Reimport after the contract clears the store, then test export via the
-        // platform API. This checks the flag, not resistance to process-memory reads.
-        let material = keyring_core::software::material(&rsa)?;
-        let handle = store.load(material)?;
-        let exported = super::KeychainStore::rsa_key(&handle)?.external_representation();
         store.clear()?;
-        assert!(exported.is_none(), "imported RSA key must not be extractable");
+        let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(
+            &mut ssh_key::rand_core::OsRng,
+            2048,
+        )?);
+        for key in [PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32])), rsa] {
+            let material = software::material(&key)?;
+            let record = material.record.clone();
+            let handle = store.load(material)?;
+            assert!(store.list()?.iter().any(|stored| stored.record == record));
+            let algorithm = if key.algorithm().is_rsa() {
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512),
+                }
+            } else {
+                Algorithm::Ed25519
+            };
+            let signature = Signature::new(algorithm.clone(), store.sign(&handle, algorithm, b"keychain")?)?;
+            signature::Verifier::verify(key.public_key(), b"keychain", &signature)?;
+            let extractable =
+                key.algorithm().is_rsa() && KeychainStore::rsa_key(&handle)?.external_representation().is_some();
+            store.delete(&handle)?;
+            assert!(store.list()?.is_empty());
+            assert!(!extractable, "imported RSA key must not be extractable");
+        }
+        store.load(software::material(&PrivateKey::from(Ed25519Keypair::from_seed(
+            &[42; 32],
+        )))?)?;
+        store.clear()?;
+        assert!(store.list()?.is_empty());
         Ok(())
     }
 }

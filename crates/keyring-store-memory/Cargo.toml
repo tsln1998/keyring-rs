@@ -7,17 +7,25 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Workspace dependencies
 keyring-core.workspace = true
+region.workspace = true
 secrecy.workspace = true
-signature.workspace = true
 ssh-key.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+# Features
+ssh-key.features = [
+  "ed25519",
+  "rsa",
+]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Workspace dependencies
 libc.workspace = true
 
 [dev-dependencies]
-rand.workspace = true
-rsa.workspace = true
+# Workspace dependencies
+signature.workspace = true
 
 [lints]
 workspace = true

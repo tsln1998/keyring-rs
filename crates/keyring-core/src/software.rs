@@ -6,14 +6,14 @@
 use crate::{KeySpec, SecrecyBytes, StoreError, StoreMaterial, StoreRecord};
 use ed25519_dalek::SigningKey;
 use rsa::{
-    RsaPrivateKey,
+    PrivateKey as RsaPrivateKey,
     pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey},
     pkcs1v15,
+    signature::{SignatureEncoding, Signer},
     traits::PublicKeyParts,
 };
 use secrecy::ExposeSecret;
 use sha2::{Sha256, Sha512};
-use signature::{SignatureEncoding, Signer};
 use ssh_key::{Algorithm, HashAlg, PrivateKey, public::KeyData};
 use zeroize::Zeroizing;
 
@@ -34,21 +34,25 @@ pub fn material(key: &PrivateKey) -> Result<StoreMaterial, StoreError> {
         ssh_key::private::KeypairData::Rsa(key) => {
             // Reconstruct the RSA key from its mathematical components so storage
             // does not depend on OpenSSH's private key container format.
+            let precision = u32::try_from(key.public.n.as_bytes().len() * 8).map_err(invalid)?;
+            let component = |value: &ssh_key::Mpint| {
+                let bytes = value
+                    .as_positive_bytes()
+                    .ok_or_else(|| invalid("RSA components must be positive"))?;
+                rsa::BoxedUint::from_be_slice(bytes, precision).map_err(invalid)
+            };
             let rsa = RsaPrivateKey::from_components(
-                rsa::BigUint::try_from(&key.public.n).map_err(invalid)?,
-                rsa::BigUint::try_from(&key.public.e).map_err(invalid)?,
-                rsa::BigUint::try_from(&key.private.d).map_err(invalid)?,
-                vec![
-                    rsa::BigUint::try_from(&key.private.p).map_err(invalid)?,
-                    rsa::BigUint::try_from(&key.private.q).map_err(invalid)?,
-                ],
+                component(&key.public.n)?,
+                component(&key.public.e)?,
+                component(&key.private.d)?,
+                vec![component(&key.private.p)?, component(&key.private.q)?],
             )
             .map_err(invalid)?;
             validate_rsa(&rsa)?;
             let der = rsa.to_pkcs1_der().map_err(invalid)?;
             (
                 KeySpec::Rsa {
-                    bits: rsa.n().bits() as u32,
+                    bits: rsa.n().bit_width(),
                 },
                 SecrecyBytes::from(der.as_bytes().to_vec().into_boxed_slice()),
             )
@@ -69,7 +73,7 @@ pub fn material(key: &PrivateKey) -> Result<StoreMaterial, StoreError> {
 
 /// Applies the modulus-size policy and checks the RSA components for consistency.
 fn validate_rsa(key: &RsaPrivateKey) -> Result<(), StoreError> {
-    if key.n().bits() < 2048 {
+    if key.n().bit_width() < 2048 {
         return Err(invalid("RSA keys require at least 2048 bits"));
     }
     key.validate().map_err(invalid)
@@ -92,12 +96,12 @@ pub fn validate(material: &StoreMaterial) -> Result<(), StoreError> {
         KeySpec::Rsa { bits } => {
             let key = RsaPrivateKey::from_pkcs1_der(material.secret.expose_secret()).map_err(invalid)?;
             validate_rsa(&key)?;
-            if key.n().bits() != bits as usize {
+            if key.n().bit_width() != bits {
                 return Err(invalid("RSA bit size does not match record"));
             }
             KeyData::from(ssh_key::public::RsaPublicKey {
-                e: ssh_key::Mpint::from_positive_bytes(&key.e().to_bytes_be()).map_err(invalid)?,
-                n: ssh_key::Mpint::from_positive_bytes(&key.n().to_bytes_be()).map_err(invalid)?,
+                e: ssh_key::Mpint::from_positive_bytes(&key.e_bytes()).map_err(invalid)?,
+                n: ssh_key::Mpint::from_positive_bytes(&key.n_bytes()).map_err(invalid)?,
             })
         }
     };
@@ -163,7 +167,7 @@ mod tests {
     /// Exercises the two separate RSA restrictions with an intentionally weak fixture.
     #[test]
     fn rsa_rejects_small_keys_and_sha1() -> Result<(), Box<dyn std::error::Error>> {
-        let rsa = RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024)?;
+        let rsa = RsaPrivateKey::new(&mut rand::rng(), 1024)?;
         let der = rsa.to_pkcs1_der()?;
         assert!(matches!(
             sign(der.as_bytes(), Algorithm::Rsa { hash: None }, b"test"),
@@ -181,7 +185,19 @@ mod tests {
             .is_err()
         );
         // Import applies the same size policy as signing.
-        let key = PrivateKey::from(ssh_key::private::RsaKeypair::try_from(rsa)?);
+        let rsa = rsa::pkcs1::RsaPrivateKeyRef::try_from(der.as_bytes())?;
+        let key = PrivateKey::from(ssh_key::private::RsaKeypair {
+            public: ssh_key::public::RsaPublicKey {
+                e: ssh_key::Mpint::from_positive_bytes(rsa.public_exponent.as_bytes())?,
+                n: ssh_key::Mpint::from_positive_bytes(rsa.modulus.as_bytes())?,
+            },
+            private: ssh_key::private::RsaPrivateKey {
+                d: ssh_key::Mpint::from_positive_bytes(rsa.private_exponent.as_bytes())?,
+                iqmp: ssh_key::Mpint::from_positive_bytes(rsa.coefficient.as_bytes())?,
+                p: ssh_key::Mpint::from_positive_bytes(rsa.prime1.as_bytes())?,
+                q: ssh_key::Mpint::from_positive_bytes(rsa.prime2.as_bytes())?,
+            },
+        });
         assert!(material(&key).is_err());
         Ok(())
     }

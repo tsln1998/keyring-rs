@@ -10,7 +10,7 @@ use crate::{
     models::BitwardenSyncResponse,
 };
 use anyhow::{Context, Result, bail};
-use bitwarden_api_identity::apis::configuration::Configuration as IdentityConfiguration;
+use bitwarden_api_identity::Configuration as IdentityConfiguration;
 use bitwarden_crypto::KeyStore;
 use keyring_core::SecrecyBytes;
 use reqwest::{Client, StatusCode};
@@ -42,18 +42,14 @@ impl BitwardenSession {
         // Installing a provider is process-wide; an already installed default remains in place.
         let _ = rustls_rustcrypto::provider().install_default();
         let client = Client::builder()
+            .user_agent("keyring-rs")
             .connect_timeout(Duration::from_secs(5))
             .read_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()?;
         let identity = IdentityConfiguration {
             base_path: config.identity_url.trim_end_matches('/').to_owned(),
-            user_agent: Some("keyring-rs".to_owned()),
-            client,
-            basic_auth: None,
-            oauth_access_token: None,
-            bearer_access_token: None,
-            api_key: None,
+            client: client.into(),
         };
         let mut token = request_api_key_token(&identity, &config.client_id, &config.client_secret).await?;
         let store = KeyStore::default();

@@ -1,0 +1,11 @@
+[[rule]]
+include = [
+  ".taplo.toml",
+  ".rustfmt.toml",
+  "Cargo.toml",
+  "crates/*/Cargo.toml",
+]
+
+[rule.formatting]
+array_auto_collapse = false
+column_width = 1

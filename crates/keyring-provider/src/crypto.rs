@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bitwarden_api_api::models::{KdfType, MasterPasswordUnlockResponseModel};
 use bitwarden_crypto::{
     Decryptable, EncString, Kdf, KeyStore, KeyStoreContext, MasterKey, SymmetricKeyAlgorithm, UnsignedSharedKey,
-    key_ids,
+    key_slot_ids,
 };
 use std::num::NonZeroU32;
 use uuid::Uuid;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 // the in-memory keystore as small as possible while still matching Bitwarden's encryption model.
 // The asymmetric account key unwraps organization keys. Signing IDs remain local-only because this
 // loader extracts SSH material instead of installing an account signing key into the SDK keystore.
-key_ids! {
+key_slot_ids! {
     #[symmetric]
     pub(crate) enum BitwardenSymmetricKeyId {
         User,
@@ -27,8 +27,8 @@ key_ids! {
         Local(LocalId),
     }
 
-    #[asymmetric]
-    pub(crate) enum BitwardenAsymmetricKeyId {
+    #[private]
+    pub(crate) enum BitwardenPrivateKeyId {
         UserPrivateKey,
         #[local]
         Local(LocalId),
@@ -40,7 +40,7 @@ key_ids! {
         Local(LocalId),
     }
 
-    pub(crate) BitwardenKeyIds => BitwardenSymmetricKeyId, BitwardenAsymmetricKeyId, BitwardenSigningKeyId;
+    pub(crate) BitwardenKeyIds => BitwardenSymmetricKeyId, BitwardenPrivateKeyId, BitwardenSigningKeyId;
 }
 
 /// Derives account decryption keys from the master password and a successful token response.
@@ -83,14 +83,19 @@ pub(crate) fn initialize_user_crypto(
     // "persist" means retaining it in the SDK's in-memory keystore, not writing it to disk.
     let user_key_id = ctx.add_local_symmetric_key(user_key);
     match ctx.get_symmetric_key_algorithm(user_key_id) {
-        Ok(SymmetricKeyAlgorithm::Aes256CbcHmac | SymmetricKeyAlgorithm::XChaCha20Poly1305) => {}
+        Ok(
+            SymmetricKeyAlgorithm::Aes256CbcHmac
+            | SymmetricKeyAlgorithm::XChaCha20Poly1305
+            | SymmetricKeyAlgorithm::XAes256Gcm,
+        ) => {}
+        Ok(SymmetricKeyAlgorithm::Aes256Gcm) => bail!("unsupported bitwarden user key algorithm"),
         Err(error) => return Err(anyhow!(error)),
     }
 
     // The private key is needed for organization-key support, but user-level item decryption can
     // still proceed if that unwrap fails.
     if let Ok(private_key_id) = ctx.unwrap_private_key(user_key_id, &private_key) {
-        ctx.persist_asymmetric_key(private_key_id, BitwardenAsymmetricKeyId::UserPrivateKey)
+        ctx.persist_private_key(private_key_id, BitwardenPrivateKeyId::UserPrivateKey)
             .context("failed to persist bitwarden private key")?;
     } else {
         tracing::warn!("bitwarden private key could not be unwrapped, skipping org key support");
@@ -116,7 +121,7 @@ pub(crate) fn initialize_org_keys(store: &KeyStore<BitwardenKeyIds>, profile: &B
     let mut ctx = store.context_mut();
 
     // Organization keys are encrypted for the user private key recovered during login bootstrap.
-    if !ctx.has_asymmetric_key(BitwardenAsymmetricKeyId::UserPrivateKey) {
+    if !ctx.has_private_key(BitwardenPrivateKeyId::UserPrivateKey) {
         bail!("bitwarden user private key is missing");
     }
 
@@ -129,12 +134,11 @@ pub(crate) fn initialize_org_keys(store: &KeyStore<BitwardenKeyIds>, profile: &B
             .parse()
             .with_context(|| format!("failed to parse bitwarden organization key for {id}"))?;
 
-        ctx.decapsulate_key_unsigned(
-            BitwardenAsymmetricKeyId::UserPrivateKey,
-            BitwardenSymmetricKeyId::Organization(id),
-            &shared_key,
-        )
-        .with_context(|| format!("failed to decrypt bitwarden organization key for {id}"))?;
+        let key = shared_key
+            .decapsulate(BitwardenPrivateKeyId::UserPrivateKey, &mut ctx)
+            .with_context(|| format!("failed to decrypt bitwarden organization key for {id}"))?;
+        ctx.persist_symmetric_key(key, BitwardenSymmetricKeyId::Organization(id))
+            .with_context(|| format!("failed to persist bitwarden organization key for {id}"))?;
     }
 
     Ok(())
@@ -218,6 +222,7 @@ fn parse_master_password_unlock(
                     .context("bitwarden argon2 response missing parallelism")?,
             )?,
         },
+        KdfType::__Unknown(_) => bail!("unsupported bitwarden kdf"),
     };
 
     // Gather the remaining unlock inputs after the KDF shape is known.

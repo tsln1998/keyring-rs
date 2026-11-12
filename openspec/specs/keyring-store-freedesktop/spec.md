@@ -28,7 +28,8 @@ Deletion and clear SHALL operate only on this application's items.
 #### Scenario: Real-platform verification
 
 - **WHEN** a real unlocked Secret Service is available for manual acceptance
-- **THEN** both algorithms SHALL pass the shared store contract with independent verification.
+- **THEN** RSA and Ed25519 SHALL round-trip through storage and produce independently
+  verified signatures, and owned items SHALL be removed by delete and clear.
 
 ### Requirement: Desktop-compatible item metadata
 

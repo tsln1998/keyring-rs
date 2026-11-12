@@ -1,18 +1,15 @@
 //! Process-local storage and software signing for imported SSH keys.
 //!
-//! Unix builds own anonymous mappings for private bytes and request memory locking.
-//! Linux also requests exclusion from ordinary core dumps. These are best-effort
-//! measures, not protection against arbitrary reads of the running process.
-
-/// Reusable backend behavior checks and deliberately non-secret test fixtures.
-pub mod contract;
+//! Private bytes live in dedicated pages managed by `region`, with best-effort
+//! memory locking on each supported platform. Linux also requests exclusion from
+//! ordinary core dumps. These measures do not prevent arbitrary process reads.
 
 use keyring_core::{
     Capabilities, KeySpec, SigningMode, Store, StoreError, StoreHandle, StoreKind, StoreMaterial, StoreRecord,
     StoredKey, software,
 };
+use region::{Allocation, LockGuard, Protection};
 use secrecy::ExposeSecret;
-#[cfg(unix)]
 use secrecy::zeroize::Zeroize;
 use ssh_key::Algorithm;
 use std::{collections::HashMap, sync::Mutex};
@@ -30,118 +27,56 @@ struct State {
     keys: HashMap<StoreHandle, ProtectedMaterial>,
 }
 
-/// Owns one key's public record and its platform-specific private byte allocation.
-///
-/// On Unix, `length` is the key size and `allocation` includes page padding that
-/// must also be wiped and unmapped. Other platforms use the secret wrapper directly.
+/// Owns private pages; `length` excludes page padding, which must also be wiped.
 struct ProtectedMaterial {
     record: StoreRecord,
-    #[cfg(not(unix))]
-    secret: keyring_core::SecrecyBytes,
-    #[cfg(unix)]
-    secret: std::ptr::NonNull<u8>,
-    #[cfg(unix)]
+    /// Field order releases the lock before its allocation is freed.
+    _lock: Option<LockGuard>,
+    secret: Allocation,
     length: usize,
-    #[cfg(unix)]
-    allocation: usize,
-    /// Records whether `mlock` succeeded so cleanup only unlocks a locked mapping.
-    #[cfg(unix)]
-    locked: bool,
 }
 
-#[cfg(unix)]
 // SAFETY: The mapping is exclusively owned and stays at the same address when this
 // value moves between threads. MemoryStore serializes access and destruction.
 unsafe impl Send for ProtectedMaterial {}
 
 impl ProtectedMaterial {
-    /// Moves an import into owned storage, copying to a dedicated mapping on Unix.
+    /// Copies imported bytes into dedicated pages on every supported platform.
     fn new(material: StoreMaterial) -> Result<Self, StoreError> {
-        #[cfg(unix)]
-        {
-            let length = material.secret.expose_secret().len();
-            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if page_size <= 0 {
-                return Err(StoreError::Backend("cannot determine memory page size".into()));
-            }
-            // A separate, whole-page mapping lets memory protections apply without
-            // affecting unrelated allocations managed by the Rust allocator.
-            let allocation = length.div_ceil(page_size as usize) * page_size as usize;
-            let pointer = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    allocation,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            if pointer == libc::MAP_FAILED {
-                return Err(StoreError::Backend("cannot allocate private key memory".into()));
-            }
-            let Some(secret) = std::ptr::NonNull::new(pointer.cast::<u8>()) else {
-                unsafe {
-                    libc::munmap(pointer, allocation);
-                }
-                return Err(StoreError::Backend("invalid private key allocation".into()));
-            };
-            // Resource limits can make mlock fail; the store still accepts the key.
-            let locked = unsafe { libc::mlock(pointer, allocation) == 0 };
-            #[cfg(target_os = "linux")]
-            unsafe {
-                // This advice is best effort and does not prevent a live memory dump.
-                libc::madvise(pointer, allocation, libc::MADV_DONTDUMP);
-            }
-            unsafe {
-                // SAFETY: The mapping is writable, covers length bytes, and is
-                // distinct from the still-live source allocation.
-                std::ptr::copy_nonoverlapping(material.secret.expose_secret().as_ptr(), secret.as_ptr(), length);
-            }
-            Ok(Self {
-                record: material.record,
-                secret,
-                length,
-                allocation,
-                locked,
-            })
+        let length = material.secret.expose_secret().len();
+        let mut secret = region::alloc(length, Protection::READ_WRITE)
+            .map_err(|error| StoreError::Backend(format!("cannot allocate private key memory: {error}")))?;
+        let lock = region::lock(secret.as_ptr::<u8>(), secret.len()).ok();
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(secret.as_mut_ptr(), secret.len(), libc::MADV_DONTDUMP);
         }
-        #[cfg(not(unix))]
-        {
-            Ok(Self {
-                record: material.record,
-                secret: material.secret,
-            })
+        unsafe {
+            // SAFETY: The writable allocation covers length bytes and is distinct
+            // from the source, whose owner zeroizes it when this function returns.
+            std::ptr::copy_nonoverlapping(material.secret.expose_secret().as_ptr(), secret.as_mut_ptr(), length);
         }
+        Ok(Self {
+            record: material.record,
+            _lock: lock,
+            secret,
+            length,
+        })
     }
 
     /// Borrows only initialized key bytes while their owning material remains alive.
     fn bytes(&self) -> &[u8] {
-        #[cfg(unix)]
-        {
-            // SAFETY: new initialized this prefix and Drop cannot run during the borrow.
-            unsafe { std::slice::from_raw_parts(self.secret.as_ptr(), self.length) }
-        }
-        #[cfg(not(unix))]
-        {
-            self.secret.expose_secret()
-        }
+        // SAFETY: new initialized this prefix and Drop cannot run during the borrow.
+        unsafe { std::slice::from_raw_parts(self.secret.as_ptr(), self.length) }
     }
 }
 
 impl Drop for ProtectedMaterial {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            unsafe {
-                // SAFETY: This value exclusively owns the live mapping. Wipe the
-                // entire allocation before releasing its lock and virtual pages.
-                std::slice::from_raw_parts_mut(self.secret.as_ptr(), self.allocation).zeroize();
-                if self.locked {
-                    libc::munlock(self.secret.as_ptr().cast(), self.allocation);
-                }
-                libc::munmap(self.secret.as_ptr().cast(), self.allocation);
-            }
+        unsafe {
+            // SAFETY: This value exclusively owns the writable allocation. Fields
+            // release the lock and allocation only after the entire region is wiped.
+            std::slice::from_raw_parts_mut(self.secret.as_mut_ptr::<u8>(), self.secret.len()).zeroize();
         }
     }
 }
@@ -226,6 +161,70 @@ impl Store for MemoryStore {
             .map_err(|_| StoreError::Backend("memory lock poisoned".into()))?
             .keys
             .clear();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssh_key::{PrivateKey, Signature, private::Ed25519Keypair};
+
+    #[test]
+    fn stores_signs_and_releases_keys() -> Result<(), Box<dyn std::error::Error>> {
+        let store = MemoryStore::default();
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32]));
+        let material = software::material(&key)?;
+        let record = material.record.clone();
+        let handle = store.load(material)?;
+        assert_eq!(
+            store.list()?,
+            vec![StoredKey {
+                handle: handle.clone(),
+                record,
+            }]
+        );
+        assert!(matches!(
+            store.load(software::material(&key)?),
+            Err(StoreError::Duplicate)
+        ));
+        let signature = Signature::new(Algorithm::Ed25519, store.sign(&handle, Algorithm::Ed25519, b"memory")?)?;
+        signature::Verifier::verify(key.public_key(), b"memory", &signature)?;
+        store.delete(&handle)?;
+        assert!(matches!(
+            store.sign(&handle, Algorithm::Ed25519, b"deleted"),
+            Err(StoreError::NotFound)
+        ));
+        let replacement = store.load(software::material(&key)?)?;
+        assert_ne!(handle, replacement);
+        store.clear()?;
+        assert!(store.list()?.is_empty());
+        assert!(matches!(
+            store.sign(&replacement, Algorithm::Ed25519, b"cleared"),
+            Err(StoreError::NotFound)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mismatched_public_record() -> Result<(), StoreError> {
+        let mut material = software::material(&PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32])))?;
+        material.record.fingerprint.push('x');
+        assert!(MemoryStore::default().load(material).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn private_pages_preserve_unaligned_payload_across_threads() -> Result<(), Box<dyn std::error::Error>> {
+        let expected = (0..region::page::size() + 7)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut material = software::material(&PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32])))?;
+        material.secret = keyring_core::SecrecyBytes::from(expected.clone().into_boxed_slice());
+        let key = ProtectedMaterial::new(material)?;
+        std::thread::spawn(move || assert_eq!(key.bytes(), expected))
+            .join()
+            .map_err(|_| "private page check panicked")?;
         Ok(())
     }
 }
