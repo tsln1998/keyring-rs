@@ -1,3 +1,4 @@
+# Build the service executable from the local Rust workspace.
 { lib, rustPlatform }:
 
 let
@@ -12,12 +13,13 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "keyring-rs";
-  version = "0.1.2";
+  inherit (builtins.fromJSON (builtins.readFile ./update.json)) version;
 
   # Keep the packaged source limited to the Rust workspace inputs so large local
   # directories such as `target/` never become part of the derivation input.
   inherit src;
 
+  # Resolve dependencies from the same lock file used by workspace development.
   cargoLock = {
     lockFile = ../../Cargo.lock;
   };
@@ -31,22 +33,16 @@ rustPlatform.buildRustPackage {
     "keyring"
   ];
 
-  # Running the package-local tests keeps the packaged service honest without expanding the flake
-  # check surface to every workspace member.
+  # Package validation covers supporting crates as well as the shipped executable.
   cargoTestFlags = [
-    "--package"
-    "keyring-cli"
+    "--workspace"
   ];
 
-  postInstall = ''
-    ln -s $out/bin/keyring $out/bin/keyring-rs
-  '';
-
   meta = with lib; {
-    description = "Configuration-driven SSH agent service with pluggable key providers";
+    description = "Bitwarden SSH agent with platform key stores";
     homepage = "https://github.com/tsln1998/keyring-rs";
     license = licenses.mit;
-    mainProgram = "keyring-rs";
+    mainProgram = "keyring";
     platforms = [
       "x86_64-linux"
       "aarch64-linux"

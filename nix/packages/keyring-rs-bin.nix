@@ -1,3 +1,4 @@
+# Install a published platform archive without compiling the Rust workspace.
 {
   lib,
   stdenvNoCC,
@@ -5,39 +6,19 @@
 }:
 
 let
-  version = "0.1.2";
-  assets = {
-    "x86_64-linux" = {
-      suffix = "linux-x86_64";
-      hash = "sha256-osO+SH3G4ELT/lhdIwz0vGgwOGhJaUGO8fkkGNH1RGQ=";
-    };
-    "aarch64-linux" = {
-      suffix = "linux-arm64";
-      hash = "sha256-75cKpI8Y75RXe1QUL877MUCBMtC6PhZxnVW296QB/NE=";
-    };
-    "x86_64-darwin" = {
-      suffix = "darwin-x86_64";
-      hash = "sha256-b5CzMvLXBKDbGwZV9ZzTIBGykZpUGptJZXl0n944eAc=";
-    };
-    "aarch64-darwin" = {
-      suffix = "darwin-arm64";
-      hash = "sha256-jDgSF/pKleyVjQ43pQ2RQQsSnOkQq20lB646Q4bq52Q=";
-    };
-  };
-  asset =
-    assets.${stdenvNoCC.hostPlatform.system}
-      or (throw "Unsupported system: ${stdenvNoCC.hostPlatform.system}");
-  archiveName = "keyring-rs-v${version}-${asset.suffix}.tar.gz";
+  inherit (builtins.fromJSON (builtins.readFile ./update.json)) version platforms;
+  inherit (stdenvNoCC.hostPlatform) system;
+  # Select for the installation platform and reject systems without a release asset.
+  asset = platforms.${system} or (throw "Unsupported system: ${system}");
+  archiveName = builtins.baseNameOf asset.url;
 in
 stdenvNoCC.mkDerivation {
   pname = "keyring-rs-bin";
   inherit version;
 
-  src = fetchurl {
-    url = "https://github.com/tsln1998/keyring-rs/releases/download/v${version}/${archiveName}";
-    inherit (asset) hash;
-  };
+  src = fetchurl asset;
 
+  # The release workflow wraps each archive in a directory with the same base name.
   sourceRoot = lib.removeSuffix ".tar.gz" archiveName;
   dontBuild = true;
 
@@ -45,6 +26,7 @@ stdenvNoCC.mkDerivation {
     runHook preInstall
 
     install -Dm755 keyring "$out/bin/keyring"
+    # Both executable names resolve to the same service and control commands.
     ln -s keyring "$out/bin/keyring-rs"
     install -Dm644 README.md "$out/share/doc/keyring-rs/README.md"
     install -Dm644 LICENSE "$out/share/licenses/keyring-rs/LICENSE"
@@ -52,17 +34,18 @@ stdenvNoCC.mkDerivation {
     runHook postInstall
   '';
 
+  # Exercise argument parsing to catch an archive that cannot run on this platform.
   doInstallCheck = true;
   installCheckPhase = ''
     "$out/bin/keyring-rs" --help >/dev/null
   '';
 
   meta = with lib; {
-    description = "Prebuilt keyring-rs SSH agent service with pluggable key providers";
+    description = "Bitwarden SSH agent with platform key stores";
     homepage = "https://github.com/tsln1998/keyring-rs";
     license = licenses.mit;
     mainProgram = "keyring-rs";
-    platforms = builtins.attrNames assets;
+    platforms = builtins.attrNames platforms;
     sourceProvenance = [ sourceTypes.binaryNativeCode ];
   };
 }

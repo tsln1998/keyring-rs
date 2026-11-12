@@ -1,0 +1,27 @@
+[package]
+name = "keyring-provider"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bitwarden-api-api.workspace = true
+bitwarden-api-identity.workspace = true
+bitwarden-crypto.workspace = true
+keyring-core.workspace = true
+reqwest.workspace = true
+rustls-rustcrypto.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ssh-key.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

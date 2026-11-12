@@ -1,34 +1,31 @@
-//! CLI-side configuration and argument types for the foreground service binary.
+//! Command-line service wiring, local control clients, and SSH-agent transport support.
 //!
-//! The binary entrypoint lives in `main.rs`; this crate keeps the reusable startup pieces
-//! separate so they can be tested and documented without the Tokio runtime wrapper.
-//!
-//! # Examples
-//!
-//! ```
-//! use clap::Parser;
-//! use keyring_cli::args::Args;
-//! use keyring_cli::config::Config;
-//! use std::io::Write;
-//!
-//! let mut file = tempfile::NamedTempFile::new().unwrap();
-//! write!(file, "[[dummy]]\nname = \"local\"\n").unwrap();
-//!
-//! let args = Args::parse_from([
-//!     "keyring",
-//!     "--config",
-//!     file.path().to_str().unwrap(),
-//!     "--path",
-//!     "/tmp/keyring-rs.sock",
-//! ]);
-//! let config = Config::new(&args.config).unwrap();
-//!
-//! assert_eq!(args.path, "/tmp/keyring-rs.sock");
-//! assert_eq!(config.dummy.len(), 1);
-//! assert!(config.bitwarden.is_empty());
-//! ```
+//! The protocol crate owns agent state; this crate supplies the process, configuration,
+//! platform listeners, and concrete storage backends needed to run it.
 
 pub mod args;
 pub mod config;
+pub mod control;
 pub mod init;
 pub mod platform;
+pub mod protocol;
+pub mod server;
+
+use anyhow::Result;
+use keyring_core::Store;
+use std::sync::Arc;
+
+/// Creates the backends available on this platform, including the memory fallback.
+///
+/// Only real backend instances are returned. The actual platform backend stays in
+/// the vector even if its initial availability probe fails; no placeholder is added.
+pub fn stores() -> Result<Vec<Arc<dyn Store>>> {
+    let stores: Vec<Arc<dyn Store>> = vec![
+        #[cfg(target_os = "macos")]
+        Arc::new(keyring_store_keychain::KeychainStore::new()),
+        #[cfg(target_os = "linux")]
+        Arc::new(keyring_store_freedesktop::FreeDesktopStore::new()?),
+        Arc::new(keyring_store_memory::MemoryStore::default()),
+    ];
+    Ok(stores)
+}

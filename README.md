@@ -1,253 +1,64 @@
 # keyring-rs
 
-`keyring-rs` is a configuration-driven SSH agent service. It runs as one foreground process,
-implements the minimal OpenSSH agent surface needed for identity listing and signing, and routes
-those operations to pluggable key providers.
+An SSH agent that loads RSA and Ed25519 keys from Bitwarden.
+Supports Linux, macOS, and Windows.
 
-The workspace currently ships with two providers:
+## Install
 
-- `dummy`: generates one deterministic in-memory `ed25519` key at startup.
-- `bitwarden`: authenticates against Bitwarden-compatible endpoints, loads SSH keys from
-  `/sync`, and signs locally with the decrypted private key material.
+From the repository:
 
-## Workspace
+```sh
+cargo install --path crates/keyring-cli --locked
+```
 
-- `crates/keyring-cli`: CLI args, TOML loading, Unix socket setup, and the `keyring` binary entrypoint.
-- `crates/keyring-core`: shared provider traits and small reusable cache primitives.
-- `crates/keyring-providers`: bundled provider implementations for dummy and Bitwarden.
-- `crates/keyring-service`: `ssh-agent-lib` agent implementation that loads provider identities lazily per client session.
+Nix users can build with `nix build .` and run `./result/bin/keyring`.
 
-## Configuration
+## Configure
 
-`keyring-rs` accepts a provider configuration document through `--config` and a Unix socket path
-through `--path`. The service has no subcommands and no control RPC surface. When the running
-process receives `SIGUSR1`, it reloads the config file currently passed through `--config`.
-
-Reload builds and validates the new configuration locally while the current agent continues
-serving clients. Invalid configurations leave the current agent and its connections running.
-After a successful reload, new connections use the new configuration, idle old connections close,
-and old connections with a request in progress close after sending its response or reaching its
-original deadline. Bitwarden login and sync remain lazy, so a successful reload does not verify
-remote credentials. Repeated reload signals during a configuration build queue one further read.
-
-Idle client connections have no lifetime limit. Each fully decoded request gets a 30-second
-cooperative deadline covering provider loading, signing, and sending the response; an expired
-request closes only its own connection. `SIGINT` and `SIGTERM` stop accepting clients, close idle
-connections, and allow active requests to finish, with a 30-second cooperative shutdown deadline.
-
-A minimal local setup with the dummy provider looks like this:
+Create `config.toml` with your Bitwarden personal API key:
 
 ```toml
-[[dummy]]
-name = "local"
+[bitwarden]
+api_url = "https://api.bitwarden.com"
+identity_url = "https://identity.bitwarden.com"
+client_id = "your-client-id"
+client_secret = "your-client-secret"
 ```
 
-Run it directly from the Rust workspace:
+Change the URLs for another region or a self-hosted server. Keep this file private.
+Your master password is entered interactively when unlocking.
 
-```bash
-cargo run -p keyring-cli -- --config ./keyring-rs.toml --path /tmp/keyring-rs.sock
+## Use
+
+Start the service in one terminal:
+
+```sh
+keyring --config config.toml --path /tmp/keyring.sock
 ```
 
-The workspace `cargo run` / `cargo build` flow is intended for local development on the current
-host. Distribution builds use the target-specific release workflow described below.
+In another terminal, connect your SSH client and unlock:
 
-Run the latest released binary from the default flake package:
-
-```bash
-nix run . -- --config ./keyring-rs.toml --path /tmp/keyring-rs.sock
+```sh
+export SSH_AUTH_SOCK=/tmp/keyring.sock
+keyring unlock
+ssh-add -L
+ssh user@host
 ```
 
-Bitwarden-backed setups use the same root document and add `[[bitwarden]]` entries:
+On Windows, use `\\.\pipe\openssh-ssh-agent` for `--path` and set
+`SSH_AUTH_SOCK` to the same value.
 
-```toml
-[[bitwarden]]
-name = "vault"
-api_url = "https://api.bitwarden.example"
-identity_url = "https://identity.bitwarden.example"
-client_id = "client-id"
-client_secret = "super-secret"
-password = "master-password"
-```
+The service starts locked and never refreshes automatically.
 
-Bitwarden HTTP requests use a 5-second connection timeout, a 5-second per-read timeout, and a
-10-second total timeout. A `/sync` response with HTTP 401 triggers authentication recovery and
-one sync retry within the original agent request deadline. Other HTTP failures and transport
-timeouts fail the load without this retry. Successful key snapshots are cached for one hour;
-failed refreshes do not publish a new snapshot or return an expired snapshot as a fallback.
-
-## Nix
-
-The flake exports:
-
-- `packages.<system>.keyring-rs`: the service built from the current source tree.
-- `packages.<system>.keyring-rs-bin`: the latest packaged GitHub Release binary.
-- `packages.<system>.default`: an alias for `keyring-rs-bin`.
-- `formatter.<system>`: `treefmt` with `nixfmt`, `taplo`, and `rustfmt`.
-- `nixosModules.keyring-rs`: a NixOS module that manages a systemd system service named `keyring-rs`.
-- `homeModules.keyring-rs`: a Home Manager module that manages `keyring-rs` through systemd on
-  Linux or launchd on macOS.
-
-The Nix packages target Linux and macOS on x86_64 and arm64. The NixOS module manages a Linux
-system service, while the Home Manager module manages a Linux or macOS user service.
-
-For local or Nix-managed builds:
-
-- `nix build .` downloads and packages the latest released binary for the current system.
-- `nix build .#keyring-rs` builds the service from the current source tree.
-- Windows: `cargo xwin build --target x86_64-pc-windows-msvc --release` produces a single `.exe`
-  with the MSVC CRT linked statically. The resulting binary still imports normal Windows system
-  DLLs such as `KERNEL32.dll`, which is expected.
-
-## Release artifacts
-
-Pushing a version tag such as `v0.2.0` publishes a GitHub Release containing the `keyring` binary
-for these targets:
-
-| Archive | Target |
+| Command | Description |
 | --- | --- |
-| `keyring-rs-v0.2.0-linux-x86_64.tar.gz` | Linux x86_64, statically linked with musl |
-| `keyring-rs-v0.2.0-linux-arm64.tar.gz` | Linux arm64, statically linked with musl |
-| `keyring-rs-v0.2.0-darwin-x86_64.tar.gz` | macOS x86_64 |
-| `keyring-rs-v0.2.0-darwin-arm64.tar.gz` | macOS arm64 |
+| `keyring unlock` | Load keys from Bitwarden using your master password. |
+| `keyring refresh` | Reload keys, prompting for your master password again. |
+| `keyring lock` | Lock the agent and clear loaded keys. |
+| `keyring status` | Show the current state and loaded keys. |
 
-Each archive contains `keyring`, this README, and the MIT license. Verify the downloaded files
-against the release's `SHA256SUMS` before extracting them:
-
-```bash
-# Linux x86_64
-grep 'linux-x86_64.tar.gz$' SHA256SUMS | sha256sum --check
-
-# macOS arm64
-grep 'darwin-arm64.tar.gz$' SHA256SUMS | shasum -a 256 --check
-```
-
-The macOS binaries are not signed or notarized. If Gatekeeper quarantines a binary downloaded
-from GitHub, inspect it first and then remove the quarantine attribute explicitly:
-
-```bash
-xattr -d com.apple.quarantine ./keyring
-```
-
-The Nix binary package is pinned independently to the latest published release because its four
-content hashes are only available after the release assets exist. Update its version and hashes in
-`nix/packages/keyring-rs-bin.nix` after publishing a new release.
-
-For local checkouts, prefer `git+file:///...` inputs or commands such as `nix build .#keyring-rs`.
-Plain `path:` inputs copy the entire working tree into the Nix store, including large build
-directories such as `target/`. If you need newly created files to be visible through a local Git
-flake input, stage them with `git add` before building.
-
-## NixOS
-
-The module uses `packages.<system>.default` (`keyring-rs-bin`) unless `package` is set explicitly.
-Import the flake module and configure `services.keyring-rs`. The module supports two ways to pass
-the service configuration:
-
-- `path`: the Unix socket path passed to `keyring-rs --path`.
-- `settings`: inline Nix attributes rendered to TOML in the Nix store.
-- `settingsFile`: an existing TOML file path passed directly to `--config`.
-
-Use `settings` only for non-secret configurations. Anything rendered through `settings` becomes
-readable from the Nix store. Secret-bearing providers such as Bitwarden should use `settingsFile`
-with a runtime-managed secret path.
-
-```nix
-{
-  inputs.keyring-rs.url = "git+file:///path/to/keyring-rs";
-
-  outputs = { nixpkgs, keyring-rs, ... }: {
-    nixosConfigurations.demo = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        keyring-rs.nixosModules.keyring-rs
-        ({ ... }: {
-          services.keyring-rs = {
-            enable = true;
-            path = "/run/keyring-rs/keyring.sock";
-            settings = {
-              dummy = [
-                { name = "local"; }
-              ];
-            };
-          };
-        })
-      ];
-    };
-  };
-}
-```
-
-The NixOS module creates the `keyring-rs` system user and group automatically when you keep the
-default `user` and `group` values.
-
-For Bitwarden or any other secret-bearing configuration, prefer `settingsFile`:
-
-```nix
-services.keyring-rs = {
-  enable = true;
-  path = "/run/keyring-rs/keyring.sock";
-  settingsFile = config.age.secrets."keyring-rs".path;
-};
-```
-
-The module always creates the parent directory of `path` before the service starts.
-
-The managed systemd service also supports manual reload:
-
-```bash
-systemctl reload keyring-rs
-```
-
-This sends `SIGUSR1` to the running process so it re-reads the current `--config` file without
-changing the bound socket path.
-
-## Home Manager
-
-The Home Manager module exports the same `settings` and `settingsFile` interface. It runs the
-service as a systemd user unit on Linux and a launchd LaunchAgent on macOS:
-
-```nix
-{ config, pkgs, ... }:
-{
-  imports = [ keyring-rs.homeModules.keyring-rs ];
-
-  services.keyring-rs = {
-    enable = true;
-    path =
-      if pkgs.stdenv.hostPlatform.isDarwin then
-        "${config.home.homeDirectory}/Library/Application Support/keyring-rs/keyring.sock"
-      else
-        "${config.home.homeDirectory}/.local/state/keyring-rs/keyring.sock";
-    settings = {
-      dummy = [
-        { name = "local"; }
-      ];
-    };
-  };
-}
-```
-
-As with the NixOS module, `settings` is suitable only for non-secret data because it is rendered
-into the Nix store. Use `settingsFile` when the configuration includes credentials. Both service
-implementations create the socket parent directory before starting and use the flake's default
-`keyring-rs-bin` package unless `package` is set explicitly.
-
-On Linux, reload the corresponding systemd user unit:
-
-```bash
-systemctl --user reload keyring-rs
-```
-
-On macOS, Home Manager installs the LaunchAgent as
-`org.nix-community.home.keyring-rs`. Inspect it or send `SIGUSR1` to reload the configuration:
-
-```bash
-launchctl print gui/$(id -u)/org.nix-community.home.keyring-rs
-launchctl kill SIGUSR1 gui/$(id -u)/org.nix-community.home.keyring-rs
-```
-
-The LaunchAgent starts when loaded, runs as a background process, and restarts after failures.
+Use `keyring status --json` for JSON output.
 
 ## License
 
-This project is licensed under the MIT license. See [LICENSE](./LICENSE).
+MIT. See [LICENSE](./LICENSE).

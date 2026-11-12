@@ -1,0 +1,23 @@
+[package]
+name = "keyring-store-freedesktop"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring-core.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+ssh-key.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+keyring-store-memory.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true
