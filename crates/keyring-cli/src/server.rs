@@ -303,7 +303,7 @@ mod tests {
                     api_url: url.clone(),
                     identity_url: url,
                     client_id: "fixture-client".into(),
-                    client_secret: "fixture-secret".into(),
+                    client_secret: "fixture-secret".to_owned().into(),
                 },
                 vec![memory.clone()],
             )?;
@@ -397,7 +397,7 @@ mod tests {
                 api_url: url.into(),
                 identity_url: url.into(),
                 client_id: "fixture".into(),
-                client_secret: "fixture".into(),
+                client_secret: "fixture".to_owned().into(),
             },
             vec![Arc::new(keyring_store_memory::MemoryStore::default())],
         )

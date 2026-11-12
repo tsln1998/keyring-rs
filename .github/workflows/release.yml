@@ -141,13 +141,12 @@ jobs:
             export MACOSX_DEPLOYMENT_TARGET=11.0
           fi
 
-          CARGO_PROFILE_RELEASE_STRIP=symbols \
-            cargo "+$RUST_TOOLCHAIN" build \
-              --locked \
-              --release \
-              --package keyring-cli \
-              --bin keyring \
-              --target "$TARGET"
+          cargo "+$RUST_TOOLCHAIN" build \
+            --locked \
+            --release \
+            --package keyring-cli \
+            --bin keyring \
+            --target "$TARGET"
 
       - name: Verify release binary
         shell: bash

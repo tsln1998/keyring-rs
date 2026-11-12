@@ -3,9 +3,9 @@
 //! The provider only needs the API-key client-credentials exchange and a small subset of the
 //! identity response payload, so this module keeps a deliberately narrow surface.
 
+use crate::models::MasterPasswordUnlockResponseModel;
 use anyhow::anyhow;
-use bitwarden_api_api::models::MasterPasswordUnlockResponseModel;
-use bitwarden_api_identity::Configuration as IdentityConfiguration;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -129,53 +129,23 @@ struct BitwardenTwoFactorResponse {
 }
 
 /// Local authentication error variants surfaced to the provider boundary.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum BitwardenAuthError {
     /// Transport, body-read, or HTTP-status failure during the token exchange.
-    TokenRequest(anyhow::Error),
+    #[error("failed to request bitwarden token")]
+    TokenRequest(#[source] anyhow::Error),
     /// A recognized structured error from the identity service.
+    #[error("{0}")]
     IdentityFail(BitwardenIdentityTokenFailResponse),
     /// The server requested an interactive flow this API-key loader does not perform.
+    #[error("bitwarden requires two-factor authentication")]
     TwoFactorRequired,
     /// No supported token-response shape could be decoded.
+    #[error("bitwarden identity response could not be parsed")]
     InvalidResponse,
     /// Token acquisition succeeded, but local account-key initialization failed.
-    CryptoBootstrap(anyhow::Error),
-}
-
-impl BitwardenAuthError {
-    /// Retains the transport or HTTP cause while assigning it to the token-request stage.
-    pub(crate) fn token_request(error: anyhow::Error) -> Self {
-        Self::TokenRequest(error)
-    }
-
-    /// Retains KDF or key-unwrapping context as a local authentication failure.
-    pub(crate) fn crypto_bootstrap(error: anyhow::Error) -> Self {
-        Self::CryptoBootstrap(error)
-    }
-}
-
-impl fmt::Display for BitwardenAuthError {
-    /// Reports the failed stage, or the identity service's description for a structured rejection.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TokenRequest(_) => formatter.write_str("failed to request bitwarden token"),
-            Self::IdentityFail(error) => fmt::Display::fmt(error, formatter),
-            Self::TwoFactorRequired => formatter.write_str("bitwarden requires two-factor authentication"),
-            Self::InvalidResponse => formatter.write_str("bitwarden identity response could not be parsed"),
-            Self::CryptoBootstrap(_) => formatter.write_str("failed to initialize bitwarden crypto"),
-        }
-    }
-}
-
-impl std::error::Error for BitwardenAuthError {
-    /// Exposes wrapped operational causes; structured identity failures are already self-describing.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::TokenRequest(error) | Self::CryptoBootstrap(error) => Some(error.as_ref()),
-            Self::IdentityFail(_) | Self::TwoFactorRequired | Self::InvalidResponse => None,
-        }
-    }
+    #[error("failed to initialize bitwarden crypto")]
+    CryptoBootstrap(#[source] anyhow::Error),
 }
 
 /// Performs the API-key token exchange against Bitwarden identity.
@@ -184,18 +154,19 @@ impl std::error::Error for BitwardenAuthError {
 /// and two-factor errors are preserved even when the endpoint returns a non-success status.
 /// Only API credentials are sent; master-password processing belongs to local crypto bootstrap.
 pub(crate) async fn request_api_key_token(
-    config: &IdentityConfiguration,
+    client: &Client,
+    identity_url: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<BitwardenTokenSuccessResponse, BitwardenAuthError> {
-    debug!(url = %config.base_path, client = client_id, "requesting bitwarden api-key token");
+    let identity_url = identity_url.trim_end_matches('/');
+    debug!(url = %identity_url, client = client_id, "requesting bitwarden api-key token");
 
     let form = BitwardenApiTokenRequest::new(client_id, client_secret);
 
     // Bitwarden expects a classic form post for API-key login rather than a JSON payload.
-    let req = config
-        .client
-        .post(format!("{}/connect/token", config.base_path))
+    let req = client
+        .post(format!("{identity_url}/connect/token"))
         .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
         .header("accept", "application/json")
         .header("Device-Type", DEVICE_TYPE.to_string())
@@ -206,7 +177,7 @@ pub(crate) async fn request_api_key_token(
     let response = req
         .send()
         .await
-        .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?;
+        .map_err(|error| BitwardenAuthError::TokenRequest(anyhow!(error)))?;
     let status = response.status();
     // Error responses carry structured identity details too; read them within the client timeout
     // before deciding whether to return a domain error or a generic HTTP failure.
@@ -215,7 +186,7 @@ pub(crate) async fn request_api_key_token(
         response
             .text()
             .await
-            .map_err(|error| BitwardenAuthError::token_request(anyhow!(error)))?,
+            .map_err(|error| BitwardenAuthError::TokenRequest(anyhow!(error)))?,
     );
 
     debug!(%status, "received bitwarden identity response");
@@ -223,7 +194,7 @@ pub(crate) async fn request_api_key_token(
     match parse_token(body.as_bytes()) {
         result if status.is_success() => result,
         Err(error @ (BitwardenAuthError::IdentityFail(_) | BitwardenAuthError::TwoFactorRequired)) => Err(error),
-        _ => Err(BitwardenAuthError::token_request(anyhow!(
+        _ => Err(BitwardenAuthError::TokenRequest(anyhow!(
             "bitwarden identity request failed with status {status}"
         ))),
     }

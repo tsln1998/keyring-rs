@@ -4,9 +4,8 @@
 //! key from master-password unlock data, import organization keys, and decrypt SSH-key items.
 
 use super::auth::BitwardenTokenSuccessResponse;
-use super::models::{BitwardenCipher, BitwardenProfile};
+use super::models::{BitwardenCipher, BitwardenProfile, MasterPasswordUnlockResponseModel};
 use anyhow::{Context, Result, anyhow, bail};
-use bitwarden_api_api::models::{KdfType, MasterPasswordUnlockResponseModel};
 use bitwarden_crypto::{
     Decryptable, EncString, Kdf, KeyStore, KeyStoreContext, MasterKey, SymmetricKeyAlgorithm, UnsignedSharedKey,
     key_slot_ids,
@@ -204,10 +203,10 @@ fn parse_master_password_unlock(
 ) -> Result<BitwardenMasterPasswordUnlockData> {
     // Translate the remote KDF description into the exact enum expected by `bitwarden-crypto`.
     let kdf = match response.kdf.kdf_type {
-        KdfType::PBKDF2_SHA256 => Kdf::PBKDF2 {
+        0 => Kdf::PBKDF2 {
             iterations: parse_nonzero_u32(response.kdf.iterations)?,
         },
-        KdfType::Argon2id => Kdf::Argon2id {
+        1 => Kdf::Argon2id {
             iterations: parse_nonzero_u32(response.kdf.iterations)?,
             memory: parse_nonzero_u32(
                 response
@@ -222,7 +221,7 @@ fn parse_master_password_unlock(
                     .context("bitwarden argon2 response missing parallelism")?,
             )?,
         },
-        KdfType::__Unknown(_) => bail!("unsupported bitwarden kdf"),
+        _ => bail!("unsupported bitwarden kdf"),
     };
 
     // Gather the remaining unlock inputs after the KDF shape is known.
@@ -258,4 +257,57 @@ struct BitwardenMasterPasswordUnlockData {
     master_key_wrapped_user_key: EncString,
     /// Account salt used for master-key derivation, separate from the API-key client identifier.
     salt: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_master_password_unlock;
+    use crate::models::MasterPasswordUnlockResponseModel;
+    use anyhow::{Context, Result};
+    use serde_json::json;
+
+    #[test]
+    fn unknown_kdf_identifiers_never_fall_back_to_a_supported_kdf() -> Result<()> {
+        for kind in [json!(-1), json!(2), json!(i64::MIN), json!(i64::MAX), json!(u64::MAX)] {
+            let response: MasterPasswordUnlockResponseModel =
+                serde_json::from_value(json!({"kdf": {"kdfType": kind, "iterations": 1}}))?;
+            let error = parse_master_password_unlock(&response)
+                .err()
+                .context("unknown KDF must be rejected")?;
+            assert_eq!(error.to_string(), "unsupported bitwarden kdf");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn kdf_costs_must_be_nonzero_and_argon2_costs_must_be_present() -> Result<()> {
+        for (kind, field) in [(0, "iterations"), (1, "iterations"), (1, "memory"), (1, "parallelism")] {
+            for value in [i32::MIN, -1, 0] {
+                let mut response = json!({
+                    "kdf": {"kdfType": kind, "iterations": 1, "memory": 64, "parallelism": 1}
+                });
+                response["kdf"][field] = json!(value);
+                let response = serde_json::from_value(response)?;
+                let error = parse_master_password_unlock(&response)
+                    .err()
+                    .context("invalid KDF cost must be rejected")?;
+                assert_eq!(error.to_string(), "invalid bitwarden kdf parameter");
+            }
+        }
+        for (field, message) in [
+            ("memory", "bitwarden argon2 response missing memory cost"),
+            ("parallelism", "bitwarden argon2 response missing parallelism"),
+        ] {
+            let mut response = json!({
+                "kdf": {"kdfType": 1, "iterations": 1, "memory": 64, "parallelism": 1}
+            });
+            response["kdf"][field] = serde_json::Value::Null;
+            let response = serde_json::from_value(response)?;
+            let error = parse_master_password_unlock(&response)
+                .err()
+                .context("missing Argon2 cost must be rejected")?;
+            assert_eq!(error.to_string(), message);
+        }
+        Ok(())
+    }
 }

@@ -41,6 +41,7 @@ zeroize.workspace = true
 
 # Default features
 comfy-table.default-features = false
+toml.default-features = false
 
 # Features
 clap.features = [
@@ -48,6 +49,11 @@ clap.features = [
 ]
 serde.features = [
   "derive",
+]
+toml.features = [
+  "std",
+  "serde",
+  "parse",
 ]
 tokio.features = [
   "io-util",

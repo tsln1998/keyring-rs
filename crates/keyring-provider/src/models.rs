@@ -1,4 +1,4 @@
-//! Minimal `/sync` response models used by the local Bitwarden integration.
+//! Minimal unlock and `/sync` response models used by the local Bitwarden integration.
 //!
 //! The generated upstream models do not match the payload shape returned by the deployed API for
 //! SSH-key ciphers, so the provider keeps a small hand-written subset here.
@@ -7,11 +7,57 @@
 //! fields let callers distinguish an absent value from a malformed encrypted value at its use site;
 //! an absent cipher list is treated as an empty snapshot.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Visitor};
 use uuid::Uuid;
 
 /// Bitwarden cipher type identifier for SSH keys.
 pub(crate) const CIPHER_TYPE_SSH_KEY: i64 = 5;
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub(crate) struct MasterPasswordUnlockResponseModel {
+    #[serde(rename = "kdf", alias = "Kdf")]
+    pub(crate) kdf: Box<MasterPasswordUnlockKdfResponseModel>,
+    #[serde(rename = "masterKeyEncryptedUserKey", alias = "MasterKeyEncryptedUserKey")]
+    pub(crate) master_key_encrypted_user_key: Option<String>,
+    #[serde(rename = "salt", alias = "Salt")]
+    pub(crate) salt: Option<String>,
+    #[serde(rename = "containedKeyId", alias = "ContainedKeyId")]
+    pub(crate) contained_key_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub(crate) struct MasterPasswordUnlockKdfResponseModel {
+    #[serde(rename = "kdfType", alias = "KdfType", deserialize_with = "deserialize_kdf_type")]
+    pub(crate) kdf_type: i64,
+    #[serde(rename = "iterations", alias = "Iterations")]
+    pub(crate) iterations: i32,
+    #[serde(rename = "memory", alias = "Memory")]
+    pub(crate) memory: Option<i32>,
+    #[serde(rename = "parallelism", alias = "Parallelism")]
+    pub(crate) parallelism: Option<i32>,
+}
+
+fn deserialize_kdf_type<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+    struct KdfTypeVisitor;
+
+    impl Visitor<'_> for KdfTypeVisitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an integer")
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value as i64)
+        }
+    }
+
+    deserializer.deserialize_i64(KdfTypeVisitor)
+}
 
 /// Top-level subset of the `/sync` response consumed by the provider.
 #[derive(Clone, Default, Debug, PartialEq, Deserialize)]
@@ -104,7 +150,60 @@ pub(crate) struct BitwardenCipherSshKey {
 
 #[cfg(test)]
 mod tests {
-    use super::BitwardenCipher;
+    use super::{BitwardenCipher, MasterPasswordUnlockResponseModel};
+
+    #[test]
+    fn unlock_field_aliases_and_optional_fields_match() -> Result<(), serde_json::Error> {
+        let camel: MasterPasswordUnlockResponseModel = serde_json::from_str(
+            r#"{"kdf":{"kdfType":1,"iterations":2,"memory":64,"parallelism":4},"masterKeyEncryptedUserKey":"wrapped","salt":"account","containedKeyId":"key-id"}"#,
+        )?;
+        let pascal: MasterPasswordUnlockResponseModel = serde_json::from_str(
+            r#"{"Kdf":{"KdfType":1,"Iterations":2,"Memory":64,"Parallelism":4},"MasterKeyEncryptedUserKey":"wrapped","Salt":"account","ContainedKeyId":"key-id"}"#,
+        )?;
+        assert_eq!(camel, pascal);
+        assert_eq!(camel.kdf.kdf_type, 1);
+        assert_eq!(camel.master_key_encrypted_user_key.as_deref(), Some("wrapped"));
+        assert_eq!(camel.salt.as_deref(), Some("account"));
+        assert_eq!(camel.contained_key_id.as_deref(), Some("key-id"));
+
+        for json in [
+            r#"{"kdf":{"kdfType":0,"iterations":1}}"#,
+            r#"{"kdf":{"kdfType":0,"iterations":1,"memory":null,"parallelism":null},"masterKeyEncryptedUserKey":null,"salt":null,"containedKeyId":null}"#,
+        ] {
+            let unlock: MasterPasswordUnlockResponseModel = serde_json::from_str(json)?;
+            assert!(unlock.master_key_encrypted_user_key.is_none());
+            assert!(unlock.salt.is_none());
+            assert!(unlock.contained_key_id.is_none());
+            assert!(unlock.kdf.memory.is_none());
+            assert!(unlock.kdf.parallelism.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unlock_required_fields_and_known_field_types_are_enforced() {
+        for json in [
+            r#"{}"#,
+            r#"{"kdf":null}"#,
+            r#"{"kdf":{}}"#,
+            r#"{"kdf":{"iterations":1}}"#,
+            r#"{"kdf":{"kdfType":0}}"#,
+            r#"{"kdf":{"kdfType":null,"iterations":1}}"#,
+            r#"{"kdf":{"kdfType":0.0,"iterations":1}}"#,
+            r#"{"kdf":{"kdfType":"0","iterations":1}}"#,
+            r#"{"kdf":{"kdfType":true,"iterations":1}}"#,
+            r#"{"kdf":{"kdfType":0,"iterations":null}}"#,
+            r#"{"kdf":{"kdfType":0,"iterations":1},"salt":1}"#,
+            r#"{"kdf":{"kdfType":0,"iterations":1},"masterKeyEncryptedUserKey":1}"#,
+            r#"{"kdf":{"kdfType":0,"iterations":1},"containedKeyId":1}"#,
+            r#"{"kdf":{"kdfType":0,"KdfType":0,"iterations":1}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<MasterPasswordUnlockResponseModel>(json).is_err(),
+                "{json}"
+            );
+        }
+    }
 
     /// Both supported API field spellings must preserve the archive marker.
     #[test]

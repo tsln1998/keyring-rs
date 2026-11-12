@@ -4,14 +4,13 @@
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
-use std::fmt;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 /// Configures the API and identity services used by an explicit vault load.
 ///
 /// API credentials authorize remote requests; they do not replace the master password used to
 /// decrypt the vault. Unknown configuration fields are rejected to surface mistakes early.
-#[derive(Clone, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BitwardenConfig {
     /// Base URL for vault operations, including `/sync`; deployment path prefixes are allowed.
@@ -21,7 +20,7 @@ pub struct BitwardenConfig {
     /// Bitwarden personal API-key client identifier.
     pub client_id: String,
     /// Bitwarden personal API-key secret; diagnostic formatting redacts this value.
-    pub client_secret: String,
+    pub client_secret: Zeroizing<String>,
 }
 
 impl BitwardenConfig {
@@ -47,25 +46,5 @@ impl BitwardenConfig {
             bail!("bitwarden API credentials must not be empty");
         }
         Ok(())
-    }
-}
-
-impl fmt::Debug for BitwardenConfig {
-    /// Shows connection details without exposing the API secret in derived caller diagnostics.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BitwardenConfig")
-            .field("api_url", &self.api_url)
-            .field("identity_url", &self.identity_url)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"***")
-            .finish()
-    }
-}
-
-impl Drop for BitwardenConfig {
-    /// Wipes this configuration's secret allocation; cloned configurations own separate copies.
-    fn drop(&mut self) {
-        self.client_secret.zeroize();
     }
 }

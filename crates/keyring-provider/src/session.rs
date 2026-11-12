@@ -10,7 +10,6 @@ use crate::{
     models::BitwardenSyncResponse,
 };
 use anyhow::{Context, Result, bail};
-use bitwarden_api_identity::Configuration as IdentityConfiguration;
 use bitwarden_crypto::KeyStore;
 use keyring_core::SecrecyBytes;
 use reqwest::{Client, StatusCode};
@@ -25,8 +24,8 @@ use zeroize::Zeroizing;
 pub(crate) struct BitwardenSession {
     /// Endpoint settings and API credentials used for this load's sync and optional rejected-token retry.
     config: BitwardenConfig,
-    /// Shared HTTP client and identity endpoint; no bearer token is stored in this configuration.
-    identity: IdentityConfiguration,
+    /// Shared HTTP client used for identity and vault requests.
+    client: Client,
     /// Account and organization keys needed by the current snapshot's item decryptions.
     pub(crate) store: KeyStore<BitwardenKeyIds>,
     /// Owns the current bearer token in a wrapper that wipes its allocation on drop.
@@ -47,17 +46,14 @@ impl BitwardenSession {
             .read_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()?;
-        let identity = IdentityConfiguration {
-            base_path: config.identity_url.trim_end_matches('/').to_owned(),
-            client: client.into(),
-        };
-        let mut token = request_api_key_token(&identity, &config.client_id, &config.client_secret).await?;
+        let mut token =
+            request_api_key_token(&client, &config.identity_url, &config.client_id, &config.client_secret).await?;
         let store = KeyStore::default();
         // Password derivation can be CPU- and memory-intensive, so it must not block Tokio workers.
         // Moving its inputs here ties their lifetime to the closure even if the caller goes away.
         let store = tokio::task::spawn_blocking(move || {
             let password_text = std::str::from_utf8(password.expose_secret()).context("password must be UTF-8")?;
-            initialize_user_crypto(&store, password_text, &token).map_err(BitwardenAuthError::crypto_bootstrap)?;
+            initialize_user_crypto(&store, password_text, &token).map_err(BitwardenAuthError::CryptoBootstrap)?;
             drop(password);
             // Transfer the bearer string without cloning it; the token response drops other fields.
             Ok::<_, anyhow::Error>((store, Zeroizing::new(std::mem::take(&mut token.access_token))))
@@ -65,7 +61,7 @@ impl BitwardenSession {
         .await??;
         Ok(Self {
             config,
-            identity,
+            client,
             store: store.0,
             token: store.1,
         })
@@ -76,8 +72,13 @@ impl BitwardenSession {
     /// Already initialized account keys remain in the session; renewal is only an HTTP credential
     /// recovery step, not an independent refresh of decrypted vault state.
     async fn renew(&mut self) -> Result<()> {
-        let mut response =
-            request_api_key_token(&self.identity, &self.config.client_id, &self.config.client_secret).await?;
+        let mut response = request_api_key_token(
+            &self.client,
+            &self.config.identity_url,
+            &self.config.client_id,
+            &self.config.client_secret,
+        )
+        .await?;
         self.token = Zeroizing::new(std::mem::take(&mut response.access_token));
         Ok(())
     }
@@ -89,7 +90,6 @@ impl BitwardenSession {
     pub(crate) async fn sync(&mut self) -> Result<BitwardenSyncResponse> {
         for attempt in 0..2 {
             let response = self
-                .identity
                 .client
                 .get(format!("{}/sync", self.config.api_url.trim_end_matches('/')))
                 .query(&[("excludeDomains", "true")])

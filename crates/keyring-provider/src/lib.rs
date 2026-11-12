@@ -23,31 +23,14 @@ use zeroize::Zeroizing;
 ///
 /// Callers use this distinction to report whether unlocking the account or loading its SSH keys
 /// failed. The wrapped error retains diagnostic context without changing the public stage.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// The token exchange, password decoding, or account-key initialization failed.
-    Auth(anyhow::Error),
+    #[error("Bitwarden authentication or master-password unlock failed")]
+    Auth(#[source] anyhow::Error),
     /// Sync, organization-key initialization, or the decryption worker failed.
-    Sync(anyhow::Error),
-}
-
-impl std::fmt::Display for LoadError {
-    /// Reports a stable stage description; the underlying cause remains available through `source`.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Auth(_) => "Bitwarden authentication or master-password unlock failed",
-            Self::Sync(_) => "failed to sync and decrypt Bitwarden vault",
-        })
-    }
-}
-
-impl std::error::Error for LoadError {
-    /// Preserves the original error chain for callers that need detailed diagnostics.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Auth(error) | Self::Sync(error) => Some(error.as_ref()),
-        }
-    }
+    #[error("failed to sync and decrypt Bitwarden vault")]
+    Sync(#[source] anyhow::Error),
 }
 
 /// Authenticates, unlocks, and downloads one vault snapshot, then extracts its usable SSH keys.
@@ -209,7 +192,7 @@ mod http_tests {
                     api_url: url.clone(),
                     identity_url: url,
                     client_id: "fixture-client".into(),
-                    client_secret: "fixture-secret".into(),
+                    client_secret: "fixture-secret".to_owned().into(),
                 },
                 requests,
                 task,

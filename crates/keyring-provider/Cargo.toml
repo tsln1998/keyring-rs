@@ -9,8 +9,6 @@ version.workspace = true
 [dependencies]
 # Workspace dependencies
 anyhow.workspace = true
-bitwarden-api-api.workspace = true
-bitwarden-api-identity.workspace = true
 bitwarden-crypto.workspace = true
 keyring-core.workspace = true
 reqwest.workspace = true
@@ -19,6 +17,7 @@ secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ssh-key.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -47,6 +46,9 @@ tokio.features = [
   "rt",
 ]
 uuid.features = [
+  "serde",
+]
+zeroize.features = [
   "serde",
 ]
 

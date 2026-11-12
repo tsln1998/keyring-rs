@@ -14,7 +14,12 @@ members = [
 rust-version = "1.99"
 edition = "2024"
 license = "MIT"
-version = "0.2.0-alpha2"
+version = "0.2.0-alpha3"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
 
 [workspace.dependencies]
 # Workspace crates
@@ -27,9 +32,8 @@ keyring-store-freedesktop = { path = "crates/keyring-store-freedesktop" }
 
 # Third-party dependencies
 anyhow = "1.0.104"
-bitwarden-api-api = "4.0.0"
-bitwarden-api-identity = "4.0.0"
 bitwarden-crypto = "4.0.0"
+chrono = "0.4.45"
 clap = "4.6.7"
 comfy-table = "8.0.1"
 ed25519-dalek = "3.0.0"
@@ -50,7 +54,6 @@ ssh-agent-lib = "0.6.0"
 ssh-key = "0.6.7"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-time = "0.3.55"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.1"

@@ -13,6 +13,7 @@
 pub mod control;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, SecondsFormat, Utc};
 use control::{KeyStatus, Outcome, Phase, Snapshot, Status, StoreStatus};
 use keyring_core::{KeySpec, SecrecyBytes, Store, StoreHandle, StoreKind, StoreMaterial, StoreRecord};
 use keyring_provider::{LoadError, config::BitwardenConfig};
@@ -31,7 +32,6 @@ use std::{
     fmt,
     sync::{Arc, Mutex, MutexGuard},
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{OwnedMutexGuard, watch};
 
 /// OpenSSH's signed binding between a connection and an SSH session.
@@ -259,7 +259,7 @@ impl ServiceAgent {
                 return Outcome::failure("cancelled", "unlock was cancelled");
             }
             current.keys = bindings;
-            stamp(&mut current);
+            stamp(&mut current, Utc::now());
             current.phase = Phase::Unlocked;
         }
         // Publish all keys together before disarming cleanup.
@@ -322,10 +322,16 @@ impl ServiceAgent {
 }
 
 /// Record when a complete import was published; this timestamp is not an expiry.
-fn stamp(current: &mut State) {
-    let now = OffsetDateTime::now_utc();
+fn stamp(current: &mut State, now: DateTime<Utc>) {
+    let timestamp = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
     current.snapshot = Some(Snapshot {
-        loaded_at: now.format(&Rfc3339).unwrap_or_default(),
+        loaded_at: format!(
+            "{}Z",
+            timestamp
+                .trim_end_matches('Z')
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+        ),
     });
 }
 
@@ -641,7 +647,7 @@ mod tests {
             api_url: "http://127.0.0.1:1".into(),
             identity_url: "http://127.0.0.1:1".into(),
             client_id: "id".into(),
-            client_secret: "secret".into(),
+            client_secret: "secret".to_owned().into(),
         }
     }
 
@@ -671,7 +677,7 @@ mod tests {
         let mut current = state(&agent.shared);
         current.keys = bindings;
         current.phase = Phase::Unlocked;
-        stamp(&mut current);
+        stamp(&mut current, Utc::now());
         Ok(())
     }
 
@@ -766,6 +772,23 @@ mod tests {
             }
             self.memory.clear()
         }
+    }
+
+    #[test]
+    fn snapshot_timestamps_preserve_rfc3339_fractional_precision() -> Result<()> {
+        let agent = agent(vec![Arc::new(MemoryStore::default())])?;
+        for (nanoseconds, expected) in [
+            (0, "2023-11-14T22:13:20Z"),
+            (100_000_000, "2023-11-14T22:13:20.1Z"),
+            (123_400_000, "2023-11-14T22:13:20.1234Z"),
+            (1, "2023-11-14T22:13:20.000000001Z"),
+            (999_999_999, "2023-11-14T22:13:20.999999999Z"),
+        ] {
+            let now = DateTime::from_timestamp(1_700_000_000, nanoseconds).context("invalid timestamp")?;
+            stamp(&mut state(&agent.shared), now);
+            assert_eq!(agent.status().snapshot.context("missing snapshot")?.loaded_at, expected);
+        }
+        Ok(())
     }
 
     /// Construction needs no provider connection and exposes no keys before unlock.

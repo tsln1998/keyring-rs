@@ -40,9 +40,16 @@ mod tests {
     /// Loads the current configuration and keeps API secrets out of debug output.
     #[test]
     fn loads_configuration_with_redacted_credentials() -> Result<()> {
-        let config: Config = toml::from_str(VALID)?;
-        config.bitwarden.validate()?;
-        assert!(!format!("{config:?}").contains("client_secret: \"secret\""));
+        let source = VALID.replace(
+            "client_secret='secret'",
+            "client_secret='fixture-secret-never-in-debug'",
+        );
+        let config: Config = toml::from_str(&source)?;
+        for config in [config.clone(), config] {
+            config.bitwarden.validate()?;
+            assert_eq!(config.bitwarden.client_secret.as_str(), "fixture-secret-never-in-debug");
+            assert!(!format!("{config:?}").contains("fixture-secret-never-in-debug"));
+        }
         Ok(())
     }
 

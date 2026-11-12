@@ -330,14 +330,11 @@ impl Store for KeychainStore {
         self.ready()?;
         // Bulk queries do not depend on valid records to locate private items.
         // Continue through every category after an individual failure.
-        let mut failed = false;
-        let mut query = CFMutableDictionary::<CFType, CFType>::new();
-        unsafe {
-            query.set(attribute(kSecClass), attribute(kSecClassKey));
-            query.set(attribute(kSecAttrLabel), CFString::new(LABEL).as_CFType());
-            let status = SecItemDelete(query.as_concrete_TypeRef());
-            failed |= status != 0 && status != ITEM_NOT_FOUND;
-        }
+        let mut failed = ItemSearchOptions::new()
+            .class(ItemClass::key())
+            .label(LABEL)
+            .delete()
+            .is_err_and(|error| error.code() != ITEM_NOT_FOUND);
         for service in [SEEDS, RECORDS] {
             if let Err(error) = ItemSearchOptions::new()
                 .class(ItemClass::generic_password())
