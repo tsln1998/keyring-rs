@@ -11,7 +11,11 @@ From the repository:
 cargo install --path crates/keyring-cli --locked
 ```
 
+## Nix
+
 Nix users can build with `nix build .` and run `./result/bin/keyring`.
+
+For development, run `nix develop` or use `direnv allow` to load the environment automatically.
 
 ## Configure
 

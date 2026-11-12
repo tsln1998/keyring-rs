@@ -172,7 +172,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Match the directory structure expected by the Nix binary package.
+          # Stage each release archive under its asset name.
           staging="$RUNNER_TEMP/$ASSET_NAME"
           mkdir -p "$staging"
           install -m 0755 "target/$TARGET/release/keyring" "$staging/keyring"
