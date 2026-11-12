@@ -1,89 +1,80 @@
-# keyring-cli Specification
+# keyring-cli
 
 ## Purpose
-Provide the single foreground executable that parses configuration, builds providers, prepares the Unix socket, and starts the `ssh-agent-lib` service loop.
+
+Provide the keyring binary, configuration, control client, and platform service lifecycle.
 
 ## Requirements
-### Requirement: Foreground binary entrypoint
-The `keyring-cli` crate SHALL provide the only executable entrypoint for the workspace and MUST run as a single foreground service process on one Tokio runtime without subcommands or interactive control RPCs.
 
-#### Scenario: Start the service process
-- **WHEN** the user launches the binary with `--config` or `-c` plus `--path` or `-p`
-- **THEN** `keyring-cli` starts one foreground async runtime, binds the requested Unix socket path, and does not expose additional command modes
+### Requirement: Strict single-account configuration
 
-#### Scenario: Launch without arguments
-- **WHEN** the user starts the binary without any arguments
-- **THEN** `keyring-cli` renders the generated help text and exits instead of attempting startup
+Configuration SHALL require one [bitwarden] table containing API/identity URLs and API
+credentials. Unknown fields, provider arrays, name, dummy, password, and store options
+SHALL be rejected. Debug output and parsing diagnostics SHALL not reveal credentials.
 
-### Requirement: Composition root ownership
-The `keyring-cli` crate SHALL be the only crate responsible for assembling the top-level configuration document, `keyring-providers`, and `keyring-service` into a runnable service.
+#### Scenario: Old password field
 
-#### Scenario: Build the application graph
-- **WHEN** startup proceeds with a valid configuration
-- **THEN** `keyring-cli` constructs provider trait objects, passes them directly into `ServiceAgent::new`, and does not preserve startup-only bootstrap wrappers
+- **WHEN** configuration contains password
+- **THEN** startup fails before binding the socket.
 
-### Requirement: Ordered bootstrap gating
-The `keyring-cli` crate SHALL complete configuration loading, tracing initialization, provider construction, service assembly, and Unix listener setup in a fail-fast order before it accepts client requests.
+### Requirement: Terminal control commands
 
-#### Scenario: A provider fails during startup loading
-- **WHEN** configuration parsing, static validation, or provider construction fails before the service loop begins
-- **THEN** `keyring-cli` exits before publishing a live agent listener
+The default invocation SHALL serve; unlock, refresh, lock, and status SHALL use the same agent socket,
+resolving --path before SSH_AUTH_SOCK. Unlock SHALL read its password without echo from
+the terminal, without accepting argv or environment passwords. Status SHALL have stable
+text and JSON forms, escape control characters, and distinguish not-running from locked.
+Exit codes SHALL distinguish usage, connection, state conflict, and authentication failures.
 
-### Requirement: Client failure isolation
-The `keyring-cli` crate SHALL allow idle client connections to remain open and SHALL apply one cooperative 30-second deadline to each fully decoded request, covering handling and response transmission. Client errors, request timeouts, and unwinding client-task panics SHALL NOT terminate the service loop.
+### Requirement: Status layout
 
-#### Scenario: Reuse a long-lived connection
-- **WHEN** a client remains idle for more than 30 seconds and then sends a request
-- **THEN** the connection remains usable and the new request receives its own deadline
+Human output SHALL start with STATUS and an uppercase state, followed by SNAPSHOT and
+its load timestamp only when unlocked. A STORE / STATE table SHALL preserve the order of
+the stores returned by the service, showing OK when available or a short uppercase reason
+when unavailable.
+The public-key table SHALL follow the store table only when unlocked and nonempty, with
+FINGERPRINT, ALGORITHM, STORE, SIGNING, and COMMENT columns. Tables SHALL use a borderless
+layout with automatically sized columns. JSON SHALL retain lowercase state values and return uppercase
+reason codes, using null for available stores.
 
-#### Scenario: A client request times out
-- **WHEN** request processing or response transmission reaches the request deadline
-- **THEN** `keyring-cli` closes that client connection while other clients and the listener continue operating
+#### Scenario: Linux backend list
 
-### Requirement: CLI-owned config and socket lifecycle
-The `keyring-cli` crate SHALL own the top-level TOML document, cross-provider static validation, the `--path` socket binding, and the signal-driven reload loop that rebuilds service state without a control RPC.
+- **WHEN** the service holds FreeDesktop and Memory backends
+- **THEN** status returns those two entries in service order and the client renders those
+  two rows.
 
-#### Scenario: Reclaim a stale Unix socket
-- **WHEN** the requested path is an unchanged Unix socket whose connection probe is refused
-- **THEN** `keyring-cli` removes that stale socket and retries the bind once
+### Requirement: Client-composed refresh
 
-#### Scenario: Preserve an occupied or unsafe path
-- **WHEN** the requested path has a live listener, is not a Unix socket, changes during probing, or cannot be inspected conclusively
-- **THEN** `keyring-cli` fails the bind without removing the existing path
+Refresh SHALL send lock, require its successful response, reconnect, and send unlock using
+a newly prompted terminal password. It SHALL use only the existing lock and unlock control
+extensions. A failed lock SHALL stop the sequence. Password input or unlock failure after
+successful lock SHALL leave the agent locked. Existing SSH connections SHALL be invalidated
+by the lock.
 
-#### Scenario: Keep the listener across reloads
-- **WHEN** the running process reloads its configuration
-- **THEN** `keyring-cli` keeps the original listener open instead of rebinding the socket path
+#### Scenario: Refresh with an incorrect password
 
-### Requirement: Signal-driven config reload
-The `keyring-cli` crate SHALL treat the configuration file as the only supported control surface and SHALL reload that file only when the running process receives `SIGUSR1`. It SHALL build a candidate agent with local validation while the current agent continues accepting clients, and SHALL replace the current agent only when that build succeeds. Remote provider authentication and loading SHALL remain lazy.
+- **WHEN** refresh locks successfully and the new unlock password is incorrect
+- **THEN** the unlock fails and the agent remains locked without restoring the old keys.
 
-#### Scenario: Reload the config file without rebinding the socket
-- **WHEN** the running process receives `SIGUSR1`
-- **THEN** `keyring-cli` re-reads the current `--config` file, rebuilds the provider-backed service state, and keeps serving on the original `--path`
+### Requirement: Bounded secret-aware transport
 
-#### Scenario: Reject an invalid reload
-- **WHEN** candidate configuration parsing, static validation, or provider construction fails
-- **THEN** the current agent, its client sessions, and the original listener remain available for a later reload attempt
+Transport SHALL bound packets to 1 MiB, zeroize raw framing buffers, avoid request debug
+logging, detect disconnect during unlock, and bound decoded requests plus writes to
+30 seconds except unlock at 180 seconds. Idle clients SHALL have no request timeout.
 
-#### Scenario: Drain the replaced generation
-- **WHEN** a candidate agent replaces the current agent
-- **THEN** new clients immediately use the new agent, idle old sessions close, and old sessions with an in-flight request close after transmitting its response or reaching its original deadline without accepting another request
+#### Scenario: Fragmented packet
 
-#### Scenario: Coalesce concurrent reload signals
-- **WHEN** one or more reload signals arrive while a candidate is being built
-- **THEN** `keyring-cli` schedules one subsequent re-read and never builds multiple candidates concurrently
+- **WHEN** a valid frame arrives across multiple reads
+- **THEN** it is decoded only after the whole frame is available.
 
-### Requirement: Signal-driven graceful shutdown
-The `keyring-cli` crate SHALL treat `SIGINT` and `SIGTERM` as graceful shutdown requests on Unix. It SHALL stop accepting clients and applying candidate configurations, close idle sessions, and allow in-flight requests to finish within their original deadlines. After a cooperative 30-second drain deadline it SHALL cancel remaining client tasks and release its owned socket path. Individual client failures SHALL NOT change a requested shutdown into a service failure.
+### Requirement: Platform lifecycle
 
-#### Scenario: Stop a systemd-managed service
-- **WHEN** the running process receives `SIGTERM`
-- **THEN** `keyring-cli` exits successfully after removing its owned Unix socket path so the same path can be bound on the next start
+Unix sockets SHALL be 0600 and preserve active sockets, regular files, and symlinks during
+stale-path reclamation. Windows SHALL retain named-pipe support. Unix SIGUSR1 SHALL validate
+configuration before replacement and return successful reloads to locked; invalid reloads
+SHALL preserve the active service. Shutdown SHALL drain for up to 30 seconds and clear stores.
 
-### Requirement: Secret-safe operational logging
-The `keyring-cli` crate SHALL initialize logging from environment-driven tracing filters such as `RUST_LOG` and MUST NOT emit passwords, client secrets, decrypted private keys, or full remote response bodies in operational logs.
+### Requirement: Build and assembly
 
-#### Scenario: Log a startup or runtime failure
-- **WHEN** the service records an operational failure
-- **THEN** the logs may include safe identifiers such as provider names and socket paths, but they omit raw secrets and private key material
+CLI SHALL assemble target-gated platform stores and universal Memory. Nix defaults SHALL
+build the source version, use the keyring executable, and support runtime secret files.
+Linux release binaries SHALL remain statically linked with musl.

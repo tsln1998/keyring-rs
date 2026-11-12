@@ -1,0 +1,28 @@
+[package]
+name = "keyring-protocol"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+keyring-core.workspace = true
+keyring-provider.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ssh-agent-lib.workspace = true
+ssh-key.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+keyring-store-memory.workspace = true
+rand.workspace = true
+signature.workspace = true
+
+[lints]
+workspace = true

@@ -1,34 +1,49 @@
-# keyring-core Specification
+# keyring-core
 
 ## Purpose
-Define the smallest shared traits and reusable primitives required for providers to publish SSH identities to the service layer without carrying runtime-owned models, protocol types, or provider-specific DTOs.
+
+Define platform-independent storage contracts and the single software signing implementation.
 
 ## Requirements
-### Requirement: Minimal shared core surface
-The `keyring-core` crate SHALL expose only the minimal shared traits and small reusable primitives needed by the workspace runtime, and SHALL NOT define shared structs for provider descriptors, identity handles, snapshots, refresh events, sign requests, sign responses, or secret wrappers.
 
-#### Scenario: Inspect the public API surface
-- **WHEN** another crate depends on `keyring-core`
-- **THEN** it receives only small shared contracts and primitives instead of a shared runtime data model
+### Requirement: Typed key and store contracts
 
-### Requirement: Shared single-value cache primitive
-The `keyring-core` crate SHALL provide a reusable async cache cell for one clonable value so multiple provider implementations can share the same TTL-based caching behavior without introducing provider-specific cache types into the core trait surface.
+The crate SHALL expose RSA key specifications including their actual bit size, Ed25519,
+opaque store handles, public records, capabilities, and signing
+mode. Secrets SHALL use zeroizing byte containers and SHALL NOT be serializable
+or included in debug output.
 
-#### Scenario: Reuse a fresh cached value
-- **WHEN** a caller asks for a cached value before the configured TTL expires
-- **THEN** the cache cell returns the cached clone without rerunning the initializer
+#### Scenario: Record round trip
 
-#### Scenario: Refresh an expired cached value
-- **WHEN** a cached entry is missing or expired
-- **THEN** one caller recomputes the value and stores the fresh result for later callers
+- **WHEN** a backend persists a record
+- **THEN** every public field survives the round trip.
 
-### Requirement: Load-only provider trait
-The `keyring-core` crate SHALL define one async provider trait whose only runtime operation is `load`, returning a collection of typed `ssh_key::PrivateKey` values.
+### Requirement: Synchronous store boundary
 
-#### Scenario: Implement a provider crate
-- **WHEN** a provider crate implements the shared contract
-- **THEN** it only needs to provide one async load path that returns OpenSSH private keys and does not implement refresh, sign, or descriptor accessors
+Every store SHALL implement kind, cached availability, capabilities, load, list, sign,
+delete, and clear. Unavailable stores SHALL advertise no supported specifications.
+Availability reasons SHALL use short uppercase codes with underscores between words,
+defaulting to UNAVAILABLE; available stores SHALL return no reason.
+Duplicate public-key import SHALL return Duplicate.
 
-#### Scenario: Store provider trait objects in service wiring
-- **WHEN** upper layers keep providers behind trait objects
-- **THEN** they can await `load` directly from request handling or startup wiring without introducing compatibility wrappers or mirrored sync APIs
+#### Scenario: Deleted handle
+
+- **WHEN** a key is deleted or the store cleared
+- **THEN** signing with its old handle fails.
+
+### Requirement: Shared cryptographic implementation
+
+Software signing SHALL support Ed25519 and RSA PKCS#1 v1.5 with SHA-256/SHA-512, enforce
+2048-bit RSA minimums, reconstruct distinct RSA primes, reject unsupported algorithms,
+and return SSH-compatible raw signature bytes. Import SHALL validate the secret against
+its identity, fingerprint, and RSA size.
+
+#### Scenario: Independent verification
+
+- **WHEN** a supported key signs data
+- **THEN** the signature verifies independently using its SSH public key.
+
+### Requirement: Dependency isolation
+
+Core SHALL NOT depend on Tokio, platform APIs, HTTP, concrete stores, or ssh-agent-lib.
+Platform signing SHALL not imply guaranteed hardware execution.

@@ -1,3 +1,4 @@
+# Validate a version tag, build native platform archives, and publish them together.
 name: Release
 
 on:
@@ -5,15 +6,18 @@ on:
     tags:
       - "v*"
 
+# Only the final publishing job receives repository write access.
 permissions:
   contents: read
 
 concurrency:
   group: release-${{ github.ref }}
+  # Let an in-flight tag release finish rather than canceling its publication.
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  # Use one explicit compiler version for validation and every release target.
   RUST_TOOLCHAIN: 1.89.0
 
 jobs:
@@ -41,6 +45,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The CLI crate owns the executable version used in release tags and assets.
           package_version="$({
             cargo "+$RUST_TOOLCHAIN" metadata --locked --no-deps --format-version 1
           } | jq -r '.packages[] | select(.name == "keyring-cli") | .version')"
@@ -56,6 +61,7 @@ jobs:
             exit 1
           fi
 
+          # A SemVer prerelease suffix also marks the GitHub Release as a prerelease.
           if [[ "$package_version" == *-* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
@@ -72,9 +78,12 @@ jobs:
     name: Build ${{ matrix.os }} ${{ matrix.arch }}
     needs: validate
     strategy:
+      # Keep collecting other platform builds if one target fails.
       fail-fast: false
       matrix:
         include:
+          # Native runners can execute their artifacts during verification.
+          # Linux uses musl targets so published binaries do not require glibc.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             os: linux
@@ -117,6 +126,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Set the same minimum macOS version for both supported architectures.
           if [[ "${{ matrix.os }}" == "darwin" ]]; then
             export MACOSX_DEPLOYMENT_TARGET=11.0
           fi
@@ -138,6 +148,7 @@ jobs:
           test -x "$binary"
           "$binary" --help >/dev/null
 
+          # Confirm the artifact's architecture instead of trusting its filename.
           description="$(file "$binary")"
           echo "$description"
           if [[ "$description" != *"${{ matrix.file-pattern }}"* ]]; then
@@ -145,6 +156,7 @@ jobs:
             exit 1
           fi
 
+          # Reject an accidentally dynamic Linux build before packaging it.
           if [[ "${{ matrix.os }}" == "linux" ]]; then
             linkage="$(ldd "$binary" 2>&1 || true)"
             echo "$linkage"
@@ -160,6 +172,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Match the directory structure expected by the Nix binary package.
           staging="$RUNNER_TEMP/$ASSET_NAME"
           mkdir -p "$staging"
           install -m 0755 "target/$TARGET/release/keyring" "$staging/keyring"
@@ -176,6 +189,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    # Publish only after validation and every matrix build have succeeded.
     needs:
       - validate
       - build
@@ -196,6 +210,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Require exactly one archive for each supported OS and architecture.
           expected=(
             "keyring-rs-$GITHUB_REF_NAME-linux-x86_64.tar.gz"
             "keyring-rs-$GITHUB_REF_NAME-linux-arm64.tar.gz"
@@ -219,6 +234,7 @@ jobs:
       - name: Generate checksums
         working-directory: dist
         run: |
+          # Publish hashes of the exact downloaded archives that will be uploaded.
           sha256sum ./*.tar.gz > SHA256SUMS
           sha256sum --check SHA256SUMS
 

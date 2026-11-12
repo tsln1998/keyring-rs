@@ -1,0 +1,23 @@
+[package]
+name = "keyring-store-memory"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+keyring-core.workspace = true
+secrecy.workspace = true
+signature.workspace = true
+ssh-key.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+rsa.workspace = true
+
+[lints]
+workspace = true

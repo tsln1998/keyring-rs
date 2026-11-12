@@ -1,3 +1,4 @@
+# Integrate the agent with a user's Linux systemd or macOS launchd session.
 { self }:
 {
   config,
@@ -15,6 +16,7 @@ let
   configFile = common.mkConfigFile "keyring-rs-user" cfg;
   pathParent = common.mkParent cfg;
   inherit (pkgs.stdenv.hostPlatform) isDarwin isLinux;
+  # Replace the wrapper process so launchd supervises the agent itself.
   launchdStartScript = pkgs.writeShellScript "keyring-rs-start" ''
     ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg pathParent}
     exec ${common.mkExecStart cfg configFile}
@@ -36,6 +38,7 @@ in
         ];
       }
 
+      # A user service shares the account and session used by desktop key stores.
       (lib.mkIf (isLinux && configFile != null) {
         systemd.user.services.keyring-rs = {
           Unit = {
@@ -67,6 +70,8 @@ in
           enable = true;
           config = {
             ProgramArguments = [ "${launchdStartScript}" ];
+            # Restart crashes and unsuccessful exits without forcing successful exits
+            # to restart. RunAtLoad still starts the agent when the job is loaded.
             KeepAlive = {
               Crashed = true;
               SuccessfulExit = false;

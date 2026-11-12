@@ -1,0 +1,25 @@
+[package]
+name = "keyring-store-keychain"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring-core.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+ssh-key.workspace = true
+security-framework.workspace = true
+security-framework-sys.workspace = true
+core-foundation.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+keyring-store-memory.workspace = true
+rand.workspace = true
+ssh-key.workspace = true
+
+[lints]
+workspace = true

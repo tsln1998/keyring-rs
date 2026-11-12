@@ -1,5 +1,6 @@
+# Expose source and release-binary packages, shared formatting, and service modules.
 {
-  description = "keyring-rs: configuration-driven SSH agent service";
+  description = "keyring-rs: Bitwarden SSH agent with platform key stores";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -31,13 +32,14 @@
       in
       {
         packages = rec {
+          default = keyring-rs;
           keyring-rs = sourcePackage;
           keyring-rs-bin = binaryPackage;
-          default = keyring-rs-bin;
         };
 
         formatter = treefmtEval.config.build.wrapper;
 
+        # Include both installation paths in the checks exported for each system.
         checks = {
           package = sourcePackage;
           package-bin = binaryPackage;
@@ -45,6 +47,8 @@
         };
       }
     )
+    # Modules select their package using the consuming configuration's platform.
+    # Export them once rather than nesting them under a build-system attribute.
     // {
       nixosModules = {
         keyring-rs = import ./nix/modules/nixos.nix { inherit self; };

@@ -1,3 +1,5 @@
+# Run a Linux system service under a configured service account.
+# The Home Manager module is the alternative for a desktop user's session.
 { self }:
 {
   config,
@@ -45,6 +47,7 @@ in
   config = lib.mkIf cfg.enable {
     assertions = common.mkAssertions "services.keyring-rs" cfg;
 
+    # Manage only the default identity; custom accounts remain the caller's concern.
     users.groups = lib.mkIf (cfg.group == "keyring-rs") {
       "keyring-rs" = { };
     };
@@ -59,10 +62,12 @@ in
 
     systemd.services.keyring-rs = lib.mkIf (configFile != null) {
       description = "keyring-rs SSH agent service";
+      # Network ordering does not unlock the vault; loading requires a client unlock.
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      # Prepare the socket directory with service ownership before dropping privileges.
       preStart = ''
         ${pkgs.coreutils}/bin/install -d -m0750 -o ${lib.escapeShellArg cfg.user} -g ${lib.escapeShellArg cfg.group} ${lib.escapeShellArg pathParent}
       '';
@@ -75,6 +80,7 @@ in
         RestartSec = 5;
         User = cfg.user;
         Group = cfg.group;
+        # The directory setup needs root; the long-running process uses User and Group.
         PermissionsStartOnly = true;
       };
     };

@@ -3,12 +3,13 @@
 //! This module keeps platform-specific bind and socket lifecycle details out of `main.rs`.
 //! On Unix it owns path unlinking on drop; on Windows it owns named-pipe creation together with
 //! the custom security descriptor required by the foreground agent.
+//!
+//! These endpoints carry ordinary local IPC traffic. Unix mode bits and the Windows DACL
+//! control access; neither wrapper adds encryption to the SSH-agent protocol.
 
 use anyhow::Result;
 use ssh_agent_lib::agent::ListeningSocket;
 
-#[cfg(windows)]
-use core::future::pending;
 #[cfg(windows)]
 use std::ffi::{OsString, c_void};
 #[cfg(unix)]
@@ -18,7 +19,7 @@ use std::io;
 #[cfg(windows)]
 use std::mem::size_of;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -48,6 +49,7 @@ use windows::{
     core::PSTR,
 };
 
+/// Owns the Windows-allocated descriptor and the attributes that borrow its buffer.
 #[cfg(windows)]
 struct NamedPipeSecurity {
     descriptor: PSECURITY_DESCRIPTOR,
@@ -121,14 +123,23 @@ pub struct Listener {
 /// Control event received by the foreground service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignalEvent {
+    /// Re-read configuration while keeping the current agent if parsing fails.
     Reload,
+    /// Stop accepting clients and begin connection draining and store cleanup.
     Shutdown,
 }
 
+/// Windows console events that all request service shutdown.
 #[cfg(windows)]
-#[derive(Debug, Default)]
-pub struct Signal;
+#[derive(Debug)]
+pub struct Signal {
+    interrupt: tokio::signal::windows::CtrlC,
+    close: tokio::signal::windows::CtrlClose,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+}
 
+/// Unix signal subscriptions for configuration reload and process termination.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Signal {
@@ -182,11 +193,14 @@ impl Listener {
 
         let path = PathBuf::from(path);
         let inner = bind_unix(&path).await?;
+        // Ordinary socket clients must run as the owner; permissions do not encrypt payloads.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
         Ok(Self { inner, path })
     }
 }
 
+/// Binds normally, retrying only when an occupied path can be identified as a stale socket.
 #[cfg(unix)]
 async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
     match UnixListener::bind(path) {
@@ -202,8 +216,10 @@ async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
     }
 }
 
+/// Reclaims a refused socket conservatively, preserving live, non-socket, or ambiguous paths.
 #[cfg(unix)]
 async fn reclaim_stale_socket(path: &Path) -> io::Result<bool> {
+    // Inspect the directory entry itself, so a symlink is never followed during reclamation.
     let original = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => metadata,
         Ok(_) => return Ok(false),
@@ -214,6 +230,7 @@ async fn reclaim_stale_socket(path: &Path) -> io::Result<bool> {
         }
     };
 
+    // Only connection refusal establishes staleness; timeout or other errors are inconclusive.
     match timeout(Duration::from_secs(1), UnixStream::connect(path)).await {
         Ok(Ok(stream)) => {
             drop(stream);
@@ -240,6 +257,7 @@ async fn reclaim_stale_socket(path: &Path) -> io::Result<bool> {
         }
     };
 
+    // Rechecking device and inode narrows the race with another process replacing this path.
     if !current.file_type().is_socket() || original.dev() != current.dev() || original.ino() != current.ino() {
         debug!(path = %path.display(), "unix socket path changed during stale-socket probe");
         return Ok(false);
@@ -260,12 +278,14 @@ impl ListeningSocket for Listener {
     #[cfg(unix)]
     type Stream = UnixStream;
 
+    /// Accepts a Unix client and leaves peer-address metadata outside the agent session.
     #[cfg(unix)]
     async fn accept(&mut self) -> io::Result<Self::Stream> {
         debug!(path = %self.path.display(), "waiting for unix socket client");
         self.inner.accept().await.map(|(stream, _addr)| stream)
     }
 
+    /// Transfers the connected pipe while preparing the next instance under the same name.
     #[cfg(windows)]
     async fn accept(&mut self) -> std::io::Result<Self::Stream> {
         debug!("waiting for named-pipe client");
@@ -282,6 +302,7 @@ impl ListeningSocket for Listener {
 
 #[cfg(unix)]
 impl Drop for Listener {
+    /// Attempts to unlink the configured socket path when the listener owner is dropped.
     fn drop(&mut self) {
         debug!(path = %self.path.display(), "removing unix socket path during listener drop");
         let _ = fs::remove_file(&self.path);
@@ -290,17 +311,44 @@ impl Drop for Listener {
 
 #[cfg(windows)]
 impl Signal {
+    /// Registers the supported Windows console notifications.
     pub fn new() -> Result<Self> {
-        Ok(Self)
+        Ok(Self {
+            interrupt: tokio::signal::windows::ctrl_c()?,
+            close: tokio::signal::windows::ctrl_close()?,
+            shutdown: tokio::signal::windows::ctrl_shutdown()?,
+            ctrl_break: tokio::signal::windows::ctrl_break()?,
+        })
     }
 
+    /// Maps any subscribed console notification to shutdown; Windows has no reload event here.
     pub async fn recv(&mut self) -> SignalEvent {
-        pending()
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.close.recv() => {},
+            _ = self.shutdown.recv() => {},
+            _ = self.ctrl_break.recv() => {},
+        }
+        SignalEvent::Shutdown
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
+    //! Socket permissions, stale-path recovery, and preservation of unrelated path entries.
+
+    /// Checks the mode of a newly bound socket without exercising remote vault access.
+    #[tokio::test]
+    async fn socket_permissions_are_owner_only() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir()?;
+        let path = directory.path().join("permissions.sock");
+        let listener = Listener::bind(path.to_str().ok_or_else(|| anyhow::anyhow!("invalid socket path"))?).await?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        drop(listener);
+        Ok(())
+    }
+
     use super::Listener;
     use anyhow::Result;
     use std::fs;
@@ -308,6 +356,7 @@ mod tests {
     use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
     use tempfile::tempdir;
 
+    /// Models a previous process exiting without unlinking its socket pathname.
     #[tokio::test]
     async fn reclaims_stale_socket_path() -> Result<()> {
         let directory = tempdir()?;
@@ -322,6 +371,7 @@ mod tests {
         Ok(())
     }
 
+    /// Confirms startup cannot replace a listening agent's endpoint.
     #[tokio::test]
     async fn preserves_active_socket_path() -> Result<()> {
         let directory = tempdir()?;
@@ -335,6 +385,7 @@ mod tests {
         Ok(())
     }
 
+    /// Protects unrelated regular files when the configured path is already occupied.
     #[tokio::test]
     async fn preserves_regular_file_path() -> Result<()> {
         let directory = tempdir()?;
@@ -346,6 +397,7 @@ mod tests {
         Ok(())
     }
 
+    /// Confirms reclamation neither unlinks symlinks nor alters their targets.
     #[tokio::test]
     async fn preserves_symbolic_link_path() -> Result<()> {
         let directory = tempdir()?;
@@ -360,6 +412,7 @@ mod tests {
         Ok(())
     }
 
+    /// Checks normal listener destruction removes the pathname it was configured to use.
     #[tokio::test]
     async fn removes_owned_socket_path_on_drop() -> Result<()> {
         let directory = tempdir()?;
@@ -376,6 +429,7 @@ mod tests {
 
 #[cfg(unix)]
 impl Signal {
+    /// Subscribes to SIGUSR1 reloads and SIGINT or SIGTERM shutdowns.
     pub fn new() -> Result<Self> {
         Ok(Self {
             reload: signal(SignalKind::user_defined1())?,
@@ -384,6 +438,7 @@ impl Signal {
         })
     }
 
+    /// Waits for one subscribed Unix signal and translates it to a lifecycle event.
     pub async fn recv(&mut self) -> SignalEvent {
         tokio::select! {
             _ = self.reload.recv() => SignalEvent::Reload,
