@@ -38,8 +38,6 @@ impl BitwardenSession {
     /// Network timeouts cover requests, not the blocking KDF. Once the blocking closure starts,
     /// cancelling the awaiting future does not interrupt it or immediately release its inputs.
     pub(crate) async fn unlock(config: BitwardenConfig, password: SecrecyBytes) -> Result<Self> {
-        // Installing a provider is process-wide; an already installed default remains in place.
-        let _ = rustls_rustcrypto::provider().install_default();
         let client = Client::builder()
             .user_agent("keyring-rs")
             .connect_timeout(Duration::from_secs(5))

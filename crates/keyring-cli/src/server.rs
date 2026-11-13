@@ -226,6 +226,8 @@ mod tests {
         /// Loads an encrypted SSH key, verifies local signing, then locks and closes old sessions.
         #[tokio::test]
         async fn unlock_sign_without_remote_access_and_lock_roundtrip() -> Result<()> {
+            crate::init::init();
+            
             // Mirror the provider's password-derived user-key wrapping with inexpensive fixture parameters.
             let master = MasterKey::derive(
                 PASSWORD,
@@ -445,6 +447,7 @@ mod tests {
     /// Drops the client after authentication starts and checks the agent returns to locked state.
     #[tokio::test]
     async fn disconnect_during_unlock_rolls_back_to_locked() -> Result<()> {
+        crate::init::init();
         let http = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let agent = agent(&format!("http://{}", http.local_addr()?))?;
         let (mut client, server) = tokio::io::duplex(4096);

@@ -28,6 +28,7 @@ keyring-provider.workspace = true
 keyring-core.workspace = true
 keyring-store-memory.workspace = true
 rpassword.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
@@ -41,11 +42,17 @@ zeroize.workspace = true
 
 # Default features
 comfy-table.default-features = false
+rustls.default-features = false
 toml.default-features = false
 
 # Features
 clap.features = [
   "derive",
+]
+rustls.features = [
+  "ring",
+  "std",
+  "tls12",
 ]
 serde.features = [
   "derive",

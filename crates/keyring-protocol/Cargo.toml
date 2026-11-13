@@ -44,7 +44,16 @@ tokio.features = [
 [dev-dependencies]
 # Workspace dependencies
 keyring-store-memory.workspace = true
+rustls.workspace = true
 signature.workspace = true
+
+# Default features
+rustls.default-features = false
+
+# Features
+rustls.features = [
+  "ring",
+]
 
 [lints]
 workspace = true

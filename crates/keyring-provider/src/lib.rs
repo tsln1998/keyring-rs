@@ -35,6 +35,8 @@ pub enum LoadError {
 
 /// Authenticates, unlocks, and downloads one vault snapshot, then extracts its usable SSH keys.
 ///
+/// The application must install a rustls crypto provider before calling this function.
+///
 /// Invalid individual items are skipped; failure to obtain the snapshot or initialize account keys
 /// fails the entire load. Account crypto and the access token are released before successful return,
 /// while returned private-key material remains owned by the caller for backend import.
@@ -172,6 +174,8 @@ mod http_tests {
     impl Fixture {
         /// Starts an isolated server that consumes one scripted response per complete request.
         async fn new(responses: Vec<(u16, Value)>) -> Result<Self> {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let url = format!("http://{}", listener.local_addr()?);
             let requests = Arc::new(Mutex::new(Vec::new()));

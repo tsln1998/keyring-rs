@@ -964,6 +964,8 @@ mod tests {
     /// Authentication failure revokes publication and leaves rollback cleanup awaitable.
     #[tokio::test]
     async fn failed_unlock_rolls_back_without_publishing_keys() -> Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        
         let agent = agent(vec![Arc::new(MemoryStore::default())])?;
         let result = agent
             .unlock(SecrecyBytes::from(b"never-log-me".to_vec().into_boxed_slice()))

@@ -12,7 +12,6 @@ anyhow.workspace = true
 bitwarden-crypto.workspace = true
 keyring-core.workspace = true
 reqwest.workspace = true
-rustls-rustcrypto.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -50,6 +49,18 @@ uuid.features = [
 ]
 zeroize.features = [
   "serde",
+]
+
+[dev-dependencies]
+# Workspace dependencies
+rustls.workspace = true
+
+# Default features
+rustls.default-features = false
+
+# Features
+rustls.features = [
+  "ring",
 ]
 
 [lints]
