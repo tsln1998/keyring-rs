@@ -15,10 +15,12 @@ keyring-provider.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ssh-agent-lib.workspace = true
+signature.workspace = true
+ssh-encoding.workspace = true
 ssh-key.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 # Default features
 chrono.default-features = false
@@ -32,6 +34,9 @@ serde.features = [
 ]
 ssh-key.features = [
   "ed25519",
+  "p256",
+  "p384",
+  "p521",
   "rsa",
 ]
 tokio.features = [
@@ -44,8 +49,8 @@ tokio.features = [
 [dev-dependencies]
 # Workspace dependencies
 keyring-store-memory.workspace = true
+rand.workspace = true
 rustls.workspace = true
-signature.workspace = true
 
 # Default features
 rustls.default-features = false

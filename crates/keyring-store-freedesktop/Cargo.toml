@@ -35,6 +35,7 @@ zbus.features = [
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Workspace dependencies
+rand.workspace = true
 signature.workspace = true
 
 [lints]

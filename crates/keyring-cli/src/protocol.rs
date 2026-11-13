@@ -4,41 +4,13 @@
 //! zeroized on drop because unlock extensions contain the user's master password.
 
 use anyhow::{Context, Result, bail};
-use ssh_agent_lib::{
-    proto::{Request, Response},
-    ssh_encoding::{Decode, Encode, Reader},
-};
+use keyring_protocol::wire::{Request, Response};
+use ssh_encoding::{Decode, Encode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// Maximum accepted payload size, excluding the four-byte frame header.
 const MAX_PACKET: usize = 1024 * 1024;
-
-/// Owns a decoded request until it is dispatched or discarded.
-///
-/// An unlock payload still held here is wiped on drop, including queued requests
-/// abandoned when a connection ends. Ownership moves to the session on dispatch.
-pub struct Incoming(pub Option<Request>);
-
-impl Decode for Incoming {
-    type Error = <Request as Decode>::Error;
-
-    /// Wraps the ordinary protocol decoder with request-lifetime cleanup.
-    fn decode(reader: &mut impl Reader) -> Result<Self, Self::Error> {
-        Request::decode(reader).map(|request| Self(Some(request)))
-    }
-}
-
-impl Drop for Incoming {
-    /// Wipes an undispatched unlock payload without changing other extension handling.
-    fn drop(&mut self) {
-        if let Some(Request::Extension(extension)) = self.0.take()
-            && extension.name == keyring_protocol::control::UNLOCK
-        {
-            extension.details.into_bytes().zeroize();
-        }
-    }
-}
 
 /// Reads one complete bounded frame, rejecting empty packets and unused trailing bytes.
 async fn read<Packet: Decode>(reader: &mut (impl AsyncRead + Unpin)) -> Result<Packet> {
@@ -58,7 +30,7 @@ async fn read<Packet: Decode>(reader: &mut (impl AsyncRead + Unpin)) -> Result<P
 }
 
 /// Decodes a request with cleanup for unlock bytes that have not been dispatched.
-pub async fn read_request(reader: &mut (impl AsyncRead + Unpin)) -> Result<Incoming> {
+pub async fn read_request(reader: &mut (impl AsyncRead + Unpin)) -> Result<Request> {
     read(reader).await
 }
 
@@ -108,14 +80,27 @@ mod tests {
             }
             Ok::<_, std::io::Error>(())
         });
-        assert!(matches!(
-            read_request(&mut reader).await?.0,
-            Some(Request::RequestIdentities)
-        ));
+        assert!(matches!(read_request(&mut reader).await?, Request::RequestIdentities));
         sender.await??;
         let (mut reader, mut writer) = duplex(64);
         writer.write_u32((MAX_PACKET + 1) as u32).await?;
         assert!(read_request(&mut reader).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_truncated_and_trailing_packet_data() -> Result<()> {
+        for bytes in [
+            b"\0\0\0\0".as_slice(),
+            b"\0\0\0\x02\x0b\0",
+            b"\0\0\0\x04\x0b",
+            b"\0\0\0\x05\x1b\xff\xff\xff\xff",
+        ] {
+            let mut reader = bytes;
+            assert!(read_request(&mut reader).await.is_err());
+        }
+        let mut reader = b"\0\0\0\x02\x05\0".as_slice();
+        assert!(read_response(&mut reader).await.is_err());
         Ok(())
     }
 }

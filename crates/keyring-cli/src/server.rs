@@ -5,18 +5,13 @@
 
 use crate::{
     config::Config,
-    platform::{Signal, SignalEvent},
+    platform::{Listener, Signal, SignalEvent},
     protocol,
 };
 use anyhow::Result;
 use keyring_core::Store;
-use keyring_protocol::{ServiceAgent, control};
-use ssh_agent_lib::{
-    agent::{ListeningSocket, Session},
-    error::AgentError,
-    proto::{Request, Response},
-};
-use std::{fmt, path::Path, sync::Arc, time::Duration};
+use keyring_protocol::{ServiceAgent, ServiceSession, control, wire::Request};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, watch},
@@ -29,16 +24,13 @@ use tokio_util::sync::CancellationToken;
 ///
 /// A valid reload closes the old generation, clears its stores, and installs a locked
 /// agent. Invalid configuration leaves the active agent in place.
-pub async fn serve<S>(
-    listener: &mut S,
+pub async fn serve(
+    listener: &mut Listener,
     signal: &mut Signal,
     config: &Path,
     mut agent: ServiceAgent,
     stores: Vec<Arc<dyn Store>>,
-) -> Result<()>
-where
-    S: ListeningSocket + fmt::Debug + Send,
-{
+) -> Result<()> {
     let mut jobs = JoinSet::new();
     let (mut stop, _) = watch::channel(false);
     let mut reloads = JoinSet::new();
@@ -124,7 +116,7 @@ impl Drop for ReaderTask {
 /// blocking KDF or backend work already started may finish before cleanup completes.
 pub async fn handle<Stream>(
     stream: Stream,
-    mut session: impl Session,
+    mut session: ServiceSession,
     mut generation: watch::Receiver<u64>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()>
@@ -156,10 +148,9 @@ where
             _ = disconnected.cancelled() => break,
             incoming = receiver.recv() => incoming,
         };
-        let Some(mut incoming) = incoming else { break };
-        let unlock =
-            matches!(incoming.0.as_ref(), Some(Request::Extension(extension)) if extension.name == control::UNLOCK);
-        let control_request = matches!(incoming.0.as_ref(), Some(Request::Extension(extension))
+        let Some(incoming) = incoming else { break };
+        let unlock = matches!(&incoming, Request::Extension(extension) if extension.name == control::UNLOCK);
+        let control_request = matches!(&incoming, Request::Extension(extension)
             if matches!(extension.name.as_str(), control::UNLOCK | control::LOCK | control::STATUS));
         // Unlock has a larger budget for its explicit remote load and cryptographic work.
         let budget = if unlock { 180 } else { 30 };
@@ -170,15 +161,7 @@ where
                 // Lock changes the generation itself, but must still deliver its control outcome.
                 _ = generation.changed(), if !control_request => anyhow::bail!("session invalidated"),
                 _ = stop.changed(), if unlock => anyhow::bail!("unlock cancelled by service transition"),
-                response = async {
-                    let Some(request) = incoming.0.take() else { return Response::Failure };
-                    match session.handle(request).await {
-                        Ok(response) => response,
-                        Err(AgentError::ExtensionFailure) => Response::ExtensionFailure,
-                        Err(_) => Response::Failure,
-                    }
-                }
-                => response,
+                response = session.handle(incoming) => response,
             };
             tokio::select! {
                 biased;
@@ -211,8 +194,8 @@ mod tests {
         use anyhow::Context;
         use bitwarden_crypto::{EncString, Kdf, KeyEncryptable, MasterKey};
         use keyring_core::Store;
+        use keyring_protocol::wire::SignRequest;
         use serde_json::json;
-        use ssh_agent_lib::proto::SignRequest;
         use ssh_key::{LineEnding, PrivateKey, private::Ed25519Keypair};
         use std::num::NonZeroU32;
         use tokio::{
@@ -227,7 +210,7 @@ mod tests {
         #[tokio::test]
         async fn unlock_sign_without_remote_access_and_lock_roundtrip() -> Result<()> {
             crate::init::init();
-            
+
             // Mirror the provider's password-derived user-key wrapping with inexpensive fixture parameters.
             let master = MasterKey::derive(
                 PASSWORD,
@@ -337,13 +320,13 @@ mod tests {
                     anyhow::bail!("identities missing");
                 };
                 assert_eq!(identities.len(), 1);
-                assert_eq!(identities[0].credential.key_data(), key.public_key().key_data());
+                assert_eq!(&identities[0].key, key.public_key().key_data());
                 assert_eq!(identities[0].comment, "fixture key");
             }
             protocol::write(
                 &mut client,
                 &Request::SignRequest(SignRequest {
-                    credential: key.public_key().key_data().clone().into(),
+                    key: key.public_key().to_bytes()?,
                     data: b"end-to-end signature".to_vec(),
                     flags: 0,
                 }),
@@ -389,8 +372,8 @@ mod tests {
 
     use super::*;
     use keyring_protocol::control::Phase;
+    use keyring_protocol::wire::{Extension, Response};
     use keyring_provider::config::BitwardenConfig;
-    use ssh_agent_lib::proto::Extension;
 
     /// Creates a memory-only agent whose provider requests target a controlled local endpoint.
     fn agent(url: &str) -> Result<ServiceAgent> {

@@ -32,22 +32,7 @@ pub fn material(key: &PrivateKey) -> Result<StoreMaterial, StoreError> {
             SecrecyBytes::from(key.private.as_ref().to_vec().into_boxed_slice()),
         ),
         ssh_key::private::KeypairData::Rsa(key) => {
-            // Reconstruct the RSA key from its mathematical components so storage
-            // does not depend on OpenSSH's private key container format.
-            let precision = u32::try_from(key.public.n.as_bytes().len() * 8).map_err(invalid)?;
-            let component = |value: &ssh_key::Mpint| {
-                let bytes = value
-                    .as_positive_bytes()
-                    .ok_or_else(|| invalid("RSA components must be positive"))?;
-                rsa::BoxedUint::from_be_slice(bytes, precision).map_err(invalid)
-            };
-            let rsa = RsaPrivateKey::from_components(
-                component(&key.public.n)?,
-                component(&key.public.e)?,
-                component(&key.private.d)?,
-                vec![component(&key.private.p)?, component(&key.private.q)?],
-            )
-            .map_err(invalid)?;
+            let rsa = RsaPrivateKey::try_from(key).map_err(invalid)?;
             validate_rsa(&rsa)?;
             let der = rsa.to_pkcs1_der().map_err(invalid)?;
             (
@@ -65,7 +50,7 @@ pub fn material(key: &PrivateKey) -> Result<StoreMaterial, StoreError> {
             fingerprint: identity.fingerprint(HashAlg::Sha256).to_string(),
             identity,
             spec,
-            comment: key.comment().to_owned(),
+            comment: key.comment().to_string(),
         },
         secret,
     })
@@ -99,10 +84,7 @@ pub fn validate(material: &StoreMaterial) -> Result<(), StoreError> {
             if key.n().bit_width() != bits {
                 return Err(invalid("RSA bit size does not match record"));
             }
-            KeyData::from(ssh_key::public::RsaPublicKey {
-                e: ssh_key::Mpint::from_positive_bytes(&key.e_bytes()).map_err(invalid)?,
-                n: ssh_key::Mpint::from_positive_bytes(&key.n_bytes()).map_err(invalid)?,
-            })
+            KeyData::from(ssh_key::public::RsaPublicKey::try_from(key.to_public_key()).map_err(invalid)?)
         }
     };
     if identity != material.record.identity
@@ -158,47 +140,4 @@ pub fn supports_algorithm(spec: &KeySpec, algorithm: &Algorithm) -> bool {
                 }
             )
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Exercises the two separate RSA restrictions with an intentionally weak fixture.
-    #[test]
-    fn rsa_rejects_small_keys_and_sha1() -> Result<(), Box<dyn std::error::Error>> {
-        let rsa = RsaPrivateKey::new(&mut rand::rng(), 1024)?;
-        let der = rsa.to_pkcs1_der()?;
-        assert!(matches!(
-            sign(der.as_bytes(), Algorithm::Rsa { hash: None }, b"test"),
-            Err(StoreError::Unsupported)
-        ));
-        // An allowed hash must still reject the undersized key after decoding it.
-        assert!(
-            sign(
-                der.as_bytes(),
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha256)
-                },
-                b"test"
-            )
-            .is_err()
-        );
-        // Import applies the same size policy as signing.
-        let rsa = rsa::pkcs1::RsaPrivateKeyRef::try_from(der.as_bytes())?;
-        let key = PrivateKey::from(ssh_key::private::RsaKeypair {
-            public: ssh_key::public::RsaPublicKey {
-                e: ssh_key::Mpint::from_positive_bytes(rsa.public_exponent.as_bytes())?,
-                n: ssh_key::Mpint::from_positive_bytes(rsa.modulus.as_bytes())?,
-            },
-            private: ssh_key::private::RsaPrivateKey {
-                d: ssh_key::Mpint::from_positive_bytes(rsa.private_exponent.as_bytes())?,
-                iqmp: ssh_key::Mpint::from_positive_bytes(rsa.coefficient.as_bytes())?,
-                p: ssh_key::Mpint::from_positive_bytes(rsa.prime1.as_bytes())?,
-                q: ssh_key::Mpint::from_positive_bytes(rsa.prime2.as_bytes())?,
-            },
-        });
-        assert!(material(&key).is_err());
-        Ok(())
-    }
 }

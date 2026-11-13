@@ -4,11 +4,10 @@
 //! socket or named pipe without transport encryption; access depends on OS endpoint permissions.
 
 use crate::protocol;
-use anyhow::Context;
 use comfy_table::{Table, presets::NOTHING};
 use keyring_core::{SigningMode, StoreKind};
 use keyring_protocol::control::{self, Outcome, Phase, Status};
-use ssh_agent_lib::proto::{Extension, Request, Response};
+use keyring_protocol::wire::{Extension, Request, Response};
 use std::time::Duration;
 use tokio::time::timeout;
 use zeroize::Zeroizing;
@@ -95,17 +94,13 @@ pub async fn run(path: &str, action: Action) -> u8 {
     // Unlock includes remote authentication, KDF work, decryption, and backend import.
     let budget = if name == control::UNLOCK { 180 } else { 10 };
     let result = timeout(Duration::from_secs(budget), async {
-        let mut request = protocol::Incoming(Some(Request::Extension(Extension {
+        let request = Request::Extension(Extension {
             name: name.into(),
             details: details.to_vec().into(),
-        })));
-        protocol::write(&mut stream, request.0.as_ref().context("missing control request")?).await?;
+        });
+        protocol::write(&mut stream, &request).await?;
         // Release both owned payload copies before waiting for the service's response.
-        // Incoming also wipes an unsent unlock payload if this future is dropped early.
-        if let Some(Request::Extension(extension)) = request.0.take() {
-            use zeroize::Zeroize;
-            extension.details.into_bytes().zeroize();
-        }
+        drop(request);
         drop(details);
         let Response::ExtensionResponse(response) = protocol::read_response(&mut stream).await? else {
             anyhow::bail!("agent rejected control extension");
@@ -113,7 +108,7 @@ pub async fn run(path: &str, action: Action) -> u8 {
         if response.name != name {
             anyhow::bail!("unexpected agent extension response");
         }
-        Ok::<_, anyhow::Error>(response.details.into_bytes())
+        Ok::<_, anyhow::Error>(response.details)
     })
     .await;
     let bytes = match result {

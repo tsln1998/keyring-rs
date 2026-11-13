@@ -8,7 +8,6 @@
 //! control access; neither wrapper adds encryption to the SSH-agent protocol.
 
 use anyhow::Result;
-use ssh_agent_lib::agent::ListeningSocket;
 
 #[cfg(windows)]
 use std::ffi::{OsString, c_void};
@@ -271,23 +270,17 @@ async fn reclaim_stale_socket(path: &Path) -> io::Result<bool> {
     }
 }
 
-#[ssh_agent_lib::async_trait]
-impl ListeningSocket for Listener {
-    #[cfg(windows)]
-    type Stream = NamedPipeServer;
-    #[cfg(unix)]
-    type Stream = UnixStream;
-
+impl Listener {
     /// Accepts a Unix client and leaves peer-address metadata outside the agent session.
     #[cfg(unix)]
-    async fn accept(&mut self) -> io::Result<Self::Stream> {
+    pub async fn accept(&mut self) -> io::Result<UnixStream> {
         debug!(path = %self.path.display(), "waiting for unix socket client");
         self.inner.accept().await.map(|(stream, _addr)| stream)
     }
 
     /// Transfers the connected pipe while preparing the next instance under the same name.
     #[cfg(windows)]
-    async fn accept(&mut self) -> std::io::Result<Self::Stream> {
+    pub async fn accept(&mut self) -> std::io::Result<NamedPipeServer> {
         debug!("waiting for named-pipe client");
         self.inner.connect().await?;
 

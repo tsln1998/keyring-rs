@@ -362,10 +362,7 @@ mod tests {
         let store = KeychainStore::new();
         assert!(store.available());
         store.clear()?;
-        let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(
-            &mut ssh_key::rand_core::OsRng,
-            2048,
-        )?);
+        let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(&mut rand::rng(), 2048)?);
         for key in [PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32])), rsa] {
             let material = software::material(&key)?;
             let record = material.record.clone();

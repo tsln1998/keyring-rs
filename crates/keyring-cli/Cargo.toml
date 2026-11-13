@@ -6,17 +6,9 @@ publish = false
 rust-version.workspace = true
 version.workspace = true
 
-[lib]
-name = "keyring_cli"
-path = "src/lib.rs"
-
 [[bin]]
 name = "keyring"
 path = "src/main.rs"
-
-[[test]]
-name = "lifecycle"
-path = "src/app.rs"
 
 [dependencies]
 # Workspace dependencies
@@ -32,7 +24,7 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
-ssh-agent-lib.workspace = true
+ssh-encoding.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml.workspace = true

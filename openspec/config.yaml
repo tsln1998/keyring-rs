@@ -11,7 +11,7 @@ context: |
   Workspace:
   - keyring-core: synchronous Store contracts, public metadata, shared software signing.
   - keyring-provider: Bitwarden authentication, account crypto, sync and SSH material decryption.
-  - keyring-protocol: ssh-agent-lib, lifecycle, selection, reconciliation, control extensions.
+  - keyring-protocol: SSH-agent messages with ssh-encoding and ssh-key, lifecycle, selection, reconciliation, control extensions.
   - keyring-store-memory: ephemeral storage and software signing.
   - keyring-store-keychain: macOS Keychain storage and platform RSA/software Ed25519 signing.
   - keyring-store-freedesktop: Linux Secret Service storage and software signing.

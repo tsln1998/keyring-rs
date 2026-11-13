@@ -11,6 +11,7 @@
 
 /// Control extension names and the JSON messages shared with clients.
 pub mod control;
+pub mod wire;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -18,24 +19,17 @@ use control::{KeyStatus, Outcome, Phase, Snapshot, Status, StoreStatus};
 use keyring_core::{KeySpec, SecrecyBytes, Store, StoreHandle, StoreKind, StoreMaterial, StoreRecord};
 use keyring_provider::{LoadError, config::BitwardenConfig};
 use secrecy::ExposeSecret;
-use ssh_agent_lib::{
-    agent::{Agent, ListeningSocket, Session},
-    error::AgentError,
-    proto::{
-        Extension, Identity, PublicCredential, RSA_SHA2_256, RSA_SHA2_512, SignRequest,
-        extension::{MessageExtension, QueryResponse, SessionBind},
-    },
-};
+use ssh_encoding::Encode;
 use ssh_key::{Algorithm, HashAlg, Signature, public::KeyData};
 use std::{
     collections::{BTreeMap, HashSet},
-    fmt,
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::sync::{OwnedMutexGuard, watch};
+use wire::{Extension, Identity, RSA_SHA2_256, RSA_SHA2_512, Request, Response, SESSION_BIND, SignRequest};
 
 /// OpenSSH's signed binding between a connection and an SSH session.
-const BIND: &str = SessionBind::NAME;
+const BIND: &str = SESSION_BIND;
 
 /// A cloneable service handle whose clones share keys, stores, and lifecycle state.
 #[derive(Clone)]
@@ -243,13 +237,21 @@ impl ServiceAgent {
             }
             Err(LoadError::Sync(_)) => return Outcome::failure("sync", "failed to sync and decrypt Bitwarden vault"),
         };
+        tracing::debug!(keys = materials.len(), "vault load completed; importing SSH keys");
         let shared = Arc::clone(&self.shared);
         // Backend APIs are synchronous. A detached worker may finish after this
         // future is cancelled; the storage lock orders rollback after that work.
         let imported = tokio::task::spawn_blocking(move || import(&shared, materials, generation)).await;
         let bindings = match imported {
             Ok(Ok(bindings)) => bindings,
-            _ => return Outcome::failure("store", "failed to import keys; agent remains locked"),
+            Ok(Err(error)) => {
+                tracing::error!(error = ?error, "failed to import SSH keys");
+                return Outcome::failure("store", "failed to import keys; agent remains locked");
+            }
+            Err(error) => {
+                tracing::error!(%error, "SSH key import worker failed");
+                return Outcome::failure("store", "failed to import keys; agent remains locked");
+            }
         };
         {
             let mut current = state(&self.shared);
@@ -416,8 +418,13 @@ fn import(shared: &Shared, materials: Vec<StoreMaterial>, generation: u64) -> Re
     // Reconcile from a complete snapshot by removing old keys from every usable
     // backend, including duplicate homes and keys removed from the remote vault.
     for store in shared.stores.iter().filter(|store| store.available()) {
-        for key in store.list()? {
-            store.delete(&key.handle)?;
+        for key in store
+            .list()
+            .with_context(|| format!("{:?}: list existing keys", store.kind()))?
+        {
+            store
+                .delete(&key.handle)
+                .with_context(|| format!("{:?}: delete existing key", store.kind()))?;
         }
     }
     let mut bindings = BTreeMap::new();
@@ -442,13 +449,18 @@ fn import(shared: &Shared, materials: Vec<StoreMaterial>, generation: u64) -> Re
                     });
                     break;
                 }
-                Err(_) => {
-                    tracing::warn!(store = ?store.kind(), "key import failed; trying next store");
+                Err(error) => {
+                    tracing::warn!(store = ?store.kind(), %error, "key import failed; trying next store");
                     // A failing backend may have written the key before returning
                     // an error. Remove that partial home before trying another.
-                    for key in store.list()? {
+                    for key in store
+                        .list()
+                        .with_context(|| format!("{:?}: list after failed import", store.kind()))?
+                    {
                         if key.record.identity == material.record.identity {
-                            store.delete(&key.handle)?;
+                            store
+                                .delete(&key.handle)
+                                .with_context(|| format!("{:?}: delete after failed import", store.kind()))?;
                         }
                     }
                 }
@@ -462,134 +474,136 @@ fn import(shared: &Shared, materials: Vec<StoreMaterial>, generation: u64) -> Re
     Ok(bindings)
 }
 
-impl<S: ListeningSocket + fmt::Debug + Send> Agent<S> for ServiceAgent {
-    /// Give each accepted stream its own generation and session-binding history.
-    fn new_session(&mut self, _: &S::Stream) -> impl Session {
-        self.session()
+impl ServiceSession {
+    /// Dispatch supported requests, rejecting all key-management operations.
+    pub async fn handle(&mut self, request: Request) -> Response {
+        match request {
+            Request::RequestIdentities => self
+                .request_identities()
+                .await
+                .map(Response::IdentitiesAnswer)
+                .unwrap_or(Response::Failure),
+            Request::SignRequest(request) => self
+                .sign(request)
+                .await
+                .map(Response::SignResponse)
+                .unwrap_or(Response::Failure),
+            Request::Extension(extension) => match self.extension(extension).await {
+                Ok(Some(response)) => Response::ExtensionResponse(response),
+                Ok(None) => Response::Success,
+                Err(_) => Response::ExtensionFailure,
+            },
+            Request::Unsupported => Response::Failure,
+        }
     }
-}
 
-#[ssh_agent_lib::async_trait]
-impl Session for ServiceSession {
     /// Enumerate the published identities in the map's public-key order.
-    async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
+    async fn request_identities(&mut self) -> Result<Vec<Identity>> {
         let current = state(&self.agent.shared);
         self.check(&current)?;
         Ok(current
             .keys
             .iter()
             .map(|(identity, binding)| Identity {
-                credential: identity.clone().into(),
+                key: identity.clone(),
                 comment: binding.record.comment.clone(),
             })
             .collect())
     }
 
     /// Dispatch signing to the selected backend without contacting the provider.
-    async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        let PublicCredential::Key(identity) = &request.credential else {
-            return Err(AgentError::Failure);
-        };
+    async fn sign(&mut self, request: SignRequest) -> Result<Signature> {
+        let identity = ssh_key::PublicKey::from_bytes(&request.key)?;
         let binding = {
             let current = state(&self.agent.shared);
             self.check(&current)?;
-            current.keys.get(identity).cloned().ok_or(AgentError::Failure)?
+            current
+                .keys
+                .get(identity.key_data())
+                .cloned()
+                .context("unknown SSH key")?
         };
         let algorithm = algorithm(&binding.record.spec, request.flags)?;
         let shared = Arc::clone(&self.agent.shared);
         let generation = self.generation;
         // Clone only routing metadata; private material remains owned by stores.
         tokio::task::spawn_blocking(move || {
-            let _storage = shared.storage.lock().map_err(other)?;
+            let _storage = shared
+                .storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("store access lock poisoned"))?;
             // Authorization can change while this worker waits for store access.
             {
                 let current = state(&shared);
                 if current.phase != Phase::Unlocked || current.generation != generation {
-                    return Err(AgentError::Failure);
+                    bail!("session invalidated");
                 }
             }
             let store = shared
                 .stores
                 .iter()
                 .find(|store| store.kind() == binding.kind)
-                .ok_or(AgentError::Failure)?;
-            let bytes = store
-                .sign(&binding.handle, algorithm.clone(), &request.data)
-                .map_err(other)?;
+                .context("missing key store")?;
+            let bytes = store.sign(&binding.handle, algorithm.clone(), &request.data)?;
             // Invalidation cannot interrupt a backend already signing. Discard
             // its result if the generation changed during that operation.
             let current = state(&shared);
             if current.phase != Phase::Unlocked || current.generation != generation {
-                return Err(AgentError::Failure);
+                bail!("session invalidated");
             }
-            Signature::new(algorithm, bytes).map_err(other)
+            Ok(Signature::new(algorithm, bytes)?)
         })
-        .await
-        .map_err(other)?
+        .await?
     }
 
     /// Handle explicit controls and the supported standard SSH-agent extensions.
-    async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
+    async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>> {
         let name = extension.name;
-        let details = extension.details.into_bytes();
+        let mut details = extension.details;
         let response = match name.as_str() {
             control::UNLOCK => {
                 // Unlock carries raw password bytes, not JSON. Move them into
                 // the secret owner before awaiting the provider operation.
-                let password = SecrecyBytes::from(details.into_boxed_slice());
-                serde_json::to_vec(&self.agent.unlock(password).await).map_err(other)?
+                let password = SecrecyBytes::from(std::mem::take(&mut *details).into_boxed_slice());
+                serde_json::to_vec(&self.agent.unlock(password).await)?
             }
-            control::LOCK if details.is_empty() => serde_json::to_vec(&self.agent.lock().await).map_err(other)?,
-            control::STATUS if details.is_empty() => serde_json::to_vec(&self.agent.status()).map_err(other)?,
+            control::LOCK if details.is_empty() => serde_json::to_vec(&self.agent.lock().await)?,
+            control::STATUS if details.is_empty() => serde_json::to_vec(&self.agent.status())?,
             control::LOCK | control::STATUS => {
-                serde_json::to_vec(&Outcome::failure("usage", "extension payload must be empty")).map_err(other)?
+                serde_json::to_vec(&Outcome::failure("usage", "extension payload must be empty"))?
             }
             "query" => {
                 // Advertise standard extensions only; clients already know the
                 // private control names. Refresh is client-side lock + unlock.
-                return Extension::new_message(QueryResponse {
-                    extensions: vec!["query".into(), BIND.into()],
-                })
-                .map(Some)
-                .map_err(other);
+                ["query", BIND].as_slice().encode_vec()?
             }
             BIND => {
-                let extension = Extension {
-                    name,
-                    details: details.into(),
-                };
-                let bind = extension
-                    .parse_message::<SessionBind>()
-                    .map_err(|_| AgentError::ExtensionFailure)?
-                    .ok_or(AgentError::ExtensionFailure)?;
-                bind.verify_signature().map_err(|_| AgentError::ExtensionFailure)?;
+                let (session_id, forwarding) = wire::session_bind(&details)?;
                 // Bound the forwarding chain, reject replayed session IDs, and
                 // forbid extending a chain after its non-forwarding endpoint.
                 if self.binds.len() >= 64
                     || self
                         .binds
                         .iter()
-                        .any(|(id, forwarding)| *id == bind.session_id || !forwarding)
+                        .any(|(id, forwarding)| *id == session_id || !forwarding)
                 {
-                    return Err(AgentError::ExtensionFailure);
+                    bail!("invalid session binding chain");
                 }
-                self.binds.push((bind.session_id, bind.is_forwarding));
+                self.binds.push((session_id, forwarding));
                 return Ok(None);
             }
-            _ => return Err(AgentError::ExtensionFailure),
+            _ => bail!("unsupported extension"),
         };
         Ok(Some(Extension {
             name,
             details: response.into(),
         }))
     }
-}
 
-impl ServiceSession {
     /// Require both unlocked state and the generation captured at connection time.
-    fn check(&self, current: &State) -> Result<(), AgentError> {
+    fn check(&self, current: &State) -> Result<()> {
         if current.phase != Phase::Unlocked || current.generation != self.generation {
-            return Err(AgentError::Failure);
+            bail!("agent locked or session invalidated");
         }
         Ok(())
     }
@@ -598,7 +612,7 @@ impl ServiceSession {
 /// Validate SSH signing flags without allowing the legacy RSA/SHA-1 default.
 ///
 /// Ed25519 accepts no flags. If both RSA SHA-2 flags are present, SHA-256 wins.
-fn algorithm(spec: &KeySpec, flags: u32) -> Result<Algorithm, AgentError> {
+fn algorithm(spec: &KeySpec, flags: u32) -> Result<Algorithm> {
     match spec {
         KeySpec::Ed25519 if flags == 0 => Ok(Algorithm::Ed25519),
         KeySpec::Rsa { .. } if flags & !(RSA_SHA2_256 | RSA_SHA2_512) == 0 => {
@@ -611,16 +625,11 @@ fn algorithm(spec: &KeySpec, flags: u32) -> Result<Algorithm, AgentError> {
                     hash: Some(HashAlg::Sha512),
                 })
             } else {
-                Err(AgentError::Failure)
+                bail!("RSA requires a SHA-2 signature flag")
             }
         }
-        _ => Err(AgentError::Failure),
+        _ => bail!("unsupported signature flags"),
     }
-}
-
-/// Adapt backend, serialization, and task errors to the SSH-agent error type.
-fn other(error: impl fmt::Display) -> AgentError {
-    AgentError::other(std::io::Error::other(error.to_string()))
 }
 
 #[cfg(test)]
@@ -634,7 +643,6 @@ mod tests {
     use super::*;
     use keyring_core::{Capabilities, SigningMode, StoreError, StoredKey, software};
     use keyring_store_memory::MemoryStore;
-    use ssh_agent_lib::proto::Request;
     use ssh_key::{PrivateKey, private::Ed25519Keypair};
     use std::{
         sync::atomic::{AtomicBool, Ordering},
@@ -878,24 +886,20 @@ mod tests {
         let mut session = agent.session();
         let keys = session.request_identities().await?;
         assert_eq!(keys.len(), 2);
-        assert!(keys[0].credential.key_data() < keys[1].credential.key_data());
+        assert!(keys[0].key < keys[1].key);
         let signature = session
             .sign(SignRequest {
-                credential: keys[0].credential.clone(),
+                key: keys[0].key.encode_vec()?,
                 data: b"hello".to_vec(),
                 flags: 0,
             })
             .await?;
-        signature::Verifier::verify(
-            &ssh_key::PublicKey::from(keys[0].credential.key_data().clone()),
-            b"hello",
-            &signature,
-        )?;
+        signature::Verifier::verify(&ssh_key::PublicKey::from(keys[0].key.clone()), b"hello", &signature)?;
         // RSA-specific flags must still be rejected for an Ed25519 identity.
         assert!(
             session
                 .sign(SignRequest {
-                    credential: keys[0].credential.clone(),
+                    key: keys[0].key.encode_vec()?,
                     data: Vec::new(),
                     flags: RSA_SHA2_256
                 })
@@ -965,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn failed_unlock_rolls_back_without_publishing_keys() -> Result<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        
+
         let agent = agent(vec![Arc::new(MemoryStore::default())])?;
         let result = agent
             .unlock(SecrecyBytes::from(b"never-log-me".to_vec().into_boxed_slice()))
@@ -994,7 +998,7 @@ mod tests {
         let signing = tokio::spawn(async move {
             session
                 .sign(SignRequest {
-                    credential: identity.credential,
+                    key: identity.key.encode_vec()?,
                     data: b"request".to_vec(),
                     flags: 0,
                 })
@@ -1034,15 +1038,15 @@ mod tests {
         assert!(status.keys.is_empty());
         // Refresh has no server extension: clients compose lock and a fresh unlock.
         for name in ["unknown", "refresh@keyring"] {
-            assert!(matches!(
+            assert!(
                 session
                     .extension(Extension {
                         name: name.into(),
                         details: Vec::new().into()
                     })
-                    .await,
-                Err(AgentError::ExtensionFailure)
-            ));
+                    .await
+                    .is_err()
+            );
         }
         let query = session
             .extension(Extension {
@@ -1051,20 +1055,83 @@ mod tests {
             })
             .await?
             .context("missing query response")?;
-        let bytes = query.details.as_ref();
+        let bytes = query.details.as_slice();
+        assert_eq!(bytes, b"\0\0\0\x25\0\0\0\x05query\0\0\0\x18session-bind@openssh.com");
         assert!(
             !bytes
                 .windows(control::UNLOCK.len())
                 .any(|window| window == control::UNLOCK.as_bytes())
         );
-        // Route through the library dispatcher as well as calling the extension hook.
         let response = session
             .handle(Request::Extension(Extension {
                 name: control::LOCK.into(),
                 details: Vec::new().into(),
             }))
-            .await?;
-        assert!(matches!(response, ssh_agent_lib::proto::Response::ExtensionResponse(_)));
+            .await;
+        assert!(matches!(response, Response::ExtensionResponse(_)));
+        assert!(matches!(session.handle(Request::Unsupported).await, Response::Failure));
+        Ok(())
+    }
+
+    fn binding(key: &PrivateKey, session_id: &[u8], forwarding: bool) -> Result<Extension> {
+        let mut details = Vec::new();
+        key.public_key().key_data().encode_prefixed(&mut details)?;
+        session_id.encode(&mut details)?;
+        let signature: Signature = signature::Signer::try_sign(key, session_id)?;
+        signature.encode_prefixed(&mut details)?;
+        forwarding.encode(&mut details)?;
+        Ok(Extension {
+            name: BIND.into(),
+            details: details.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn session_bind_verifies_host_keys_and_rejects_replay_and_chain_extensions() -> Result<()> {
+        use ssh_key::EcdsaCurve;
+
+        let agent = agent(vec![Arc::new(MemoryStore::default())])?;
+        for algorithm in [
+            Algorithm::Ed25519,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP384,
+            },
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP521,
+            },
+            Algorithm::Rsa { hash: None },
+        ] {
+            let key = PrivateKey::random(&mut rand::rng(), algorithm)?;
+            let mut session = agent.session();
+            let mut corrupted = binding(&key, b"corrupted", true)?;
+            let last_signature_byte = corrupted.details.len() - 2;
+            corrupted.details[last_signature_byte] ^= 1;
+            assert!(session.extension(corrupted).await.is_err());
+            let mut trailing = binding(&key, b"trailing", true)?;
+            trailing.details.push(0);
+            assert!(session.extension(trailing).await.is_err());
+            assert!(session.binds.is_empty());
+            assert!(session.extension(binding(&key, b"forwarded", true)?).await?.is_none());
+            assert!(session.extension(binding(&key, b"forwarded", true)?).await.is_err());
+            assert!(session.extension(binding(&key, b"endpoint", false)?).await?.is_none());
+            assert!(session.extension(binding(&key, b"next", true)?).await.is_err());
+            assert_eq!(session.binds.len(), 2);
+        }
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[11; 32]));
+        let mut session = agent.session();
+        for identifier in 0..64u8 {
+            assert!(
+                session
+                    .extension(binding(&key, &[identifier; 32], true)?)
+                    .await?
+                    .is_none()
+            );
+        }
+        assert!(session.extension(binding(&key, b"too long", true)?).await.is_err());
+        assert_eq!(session.binds.len(), 64);
         Ok(())
     }
 
@@ -1099,10 +1166,7 @@ mod tests {
             Arc::new(desktop),
             Arc::new(MemoryStore::default()),
         ])?;
-        let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(
-            &mut ssh_key::rand_core::OsRng,
-            2048,
-        )?);
+        let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(&mut rand::rng(), 2048)?);
         publish(&agent, vec![software::material(&rsa)?, material(8)?])?;
         let status = agent.status();
         assert_eq!(status.keys[0].store, StoreKind::Keychain);
@@ -1112,7 +1176,7 @@ mod tests {
         let mut session = agent.session();
         // Exercise protocol dispatch using the flags each key algorithm requires.
         for identity in session.request_identities().await? {
-            let requested_flags: &[u32] = if identity.credential.key_data().algorithm().is_rsa() {
+            let requested_flags: &[u32] = if identity.key.algorithm().is_rsa() {
                 &[RSA_SHA2_256, RSA_SHA2_512]
             } else {
                 &[0]
@@ -1120,13 +1184,13 @@ mod tests {
             for &flags in requested_flags {
                 let signature = session
                     .sign(SignRequest {
-                        credential: identity.credential.clone(),
+                        key: identity.key.encode_vec()?,
                         data: b"mixed stores".to_vec(),
                         flags,
                     })
                     .await?;
                 signature::Verifier::verify(
-                    &ssh_key::PublicKey::from(identity.credential.key_data().clone()),
+                    &ssh_key::PublicKey::from(identity.key.clone()),
                     b"mixed stores",
                     &signature,
                 )?;

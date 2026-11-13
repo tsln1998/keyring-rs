@@ -25,6 +25,7 @@ ssh-key.features = [
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Workspace dependencies
+rand.workspace = true
 signature.workspace = true
 
 [lints]
