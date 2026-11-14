@@ -22,6 +22,9 @@ RSA SHALL import PKCS#1 material as a non-extractable SecKey and sign through
 SecKeyCreateSignature. Ed25519 SHALL store a generic-password seed and retrieve it only
 for software signing. Metadata SHALL survive process restart, and clear SHALL delete
 only this application's namespace.
+Listing SHALL enumerate account attributes from the public-record service and retrieve
+each public record separately. It SHALL NOT combine an all-matches password query with
+returning item data, or retrieve Ed25519 seeds or RSA private material while listing.
 Unavailable reasons SHALL use NO_KEYCHAIN for a missing default Keychain, LOCKED for a
 locked Keychain, and PROBE_FAILED when status inspection or the storage round trip fails.
 

@@ -157,6 +157,19 @@ impl KeychainStore {
         std::str::from_utf8(&handle.0).map_err(error)
     }
 
+    /// Extracts the account handle from an attributes-only search result.
+    fn record_id(item: SearchResult) -> Result<KeyId, Error> {
+        let SearchResult::Dict(attributes) = item else {
+            return Err(error("unexpected Keychain record attributes"));
+        };
+        let value = unsafe { attributes.find(kSecAttrAccount.cast::<c_void>()) }
+            .ok_or_else(|| error("Keychain record has no account"))?;
+        let account = unsafe { CFType::wrap_under_get_rule(*value) }
+            .downcast_into::<CFString>()
+            .ok_or_else(|| error("Keychain record account is not a string"))?;
+        Ok(KeyId(account.to_string().into_bytes()))
+    }
+
     /// Loads public metadata separately from an RSA key object or Ed25519 seed.
     fn record(handle: &KeyId) -> Result<KeyInfo, Error> {
         let bytes = get_generic_password(RECORDS, Self::account(handle)?).map_err(|e| {
@@ -301,11 +314,12 @@ impl KeyStore for KeychainStore {
     }
     fn list(&self) -> Result<Vec<(KeyId, KeyInfo)>, Error> {
         self.ready()?;
-        // Search only the public-record service; seeds and RSA key data stay untouched.
+        // Legacy Keychain rejects returning password data with Limit::All.
+        // Enumerate public-record accounts, then read each record separately.
         let result = ItemSearchOptions::new()
             .class(ItemClass::generic_password())
             .service(RECORDS)
-            .load_data(true)
+            .load_attributes(true)
             .limit(Limit::All)
             .search();
         let result = match result {
@@ -316,11 +330,9 @@ impl KeyStore for KeychainStore {
         result
             .into_iter()
             .map(|item| {
-                let SearchResult::Data(data) = item else {
-                    return Err(error("unexpected Keychain record format"));
-                };
-                let record: KeyInfo = serde_json::from_slice(&data).map_err(error)?;
-                Ok((KeyId(format!("keyring-rs:{}", record.fingerprint).into_bytes()), record))
+                let handle = Self::record_id(item)?;
+                let record = Self::record(&handle)?;
+                Ok((handle, record))
             })
             .collect()
     }
@@ -400,6 +412,25 @@ impl KeyStore for KeychainStore {
 mod tests {
     use super::*;
     use ssh_key::{PrivateKey, Signature, private::Ed25519Keypair};
+
+    #[test]
+    fn record_ids_require_string_account_attributes() -> anyhow::Result<()> {
+        let mut attributes = CFMutableDictionary::<CFType, CFType>::new();
+        assert!(KeychainStore::record_id(SearchResult::Dict(attributes.to_immutable().to_untyped())).is_err());
+        unsafe {
+            attributes.set(attribute(kSecAttrAccount), CFBoolean::true_value().as_CFType());
+        }
+        assert!(KeychainStore::record_id(SearchResult::Dict(attributes.to_immutable().to_untyped())).is_err());
+        unsafe {
+            attributes.set(attribute(kSecAttrAccount), CFString::new("keyring-rs:test").as_CFType());
+        }
+        assert_eq!(
+            KeychainStore::record_id(SearchResult::Dict(attributes.to_immutable().to_untyped()))?,
+            KeyId(b"keyring-rs:test".to_vec())
+        );
+        assert!(KeychainStore::record_id(SearchResult::Data(Vec::new())).is_err());
+        Ok(())
+    }
 
     #[test]
     fn cached_probe_result_controls_availability_and_capabilities() -> anyhow::Result<()> {

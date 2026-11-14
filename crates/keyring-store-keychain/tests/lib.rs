@@ -13,7 +13,7 @@ fn availability_probe_preserves_keys_and_removes_temporary_items() -> anyhow::Re
         match ItemSearchOptions::new()
             .class(ItemClass::generic_password())
             .service("keyring-rs.probe")
-            .load_data(true)
+            .load_attributes(true)
             .limit(Limit::All)
             .search()
         {

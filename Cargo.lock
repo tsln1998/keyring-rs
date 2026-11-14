@@ -1535,7 +1535,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-cli"
-version = "0.2.0-alpha4"
+version = "0.2.0-alpha5"
 dependencies = [
  "anyhow",
  "bitwarden-crypto",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-core"
-version = "0.2.0-alpha4"
+version = "0.2.0-alpha5"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-protocol"
-version = "0.2.0-alpha4"
+version = "0.2.0-alpha5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-provider"
-version = "0.2.0-alpha4"
+version = "0.2.0-alpha5"
 dependencies = [
  "anyhow",
  "bitwarden-crypto",
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-store-freedesktop"
-version = "0.2.0-alpha4"
+version = "0.2.0-alpha5"
 dependencies = [
  "anyhow",
  "keyring-core",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-store-keychain"
-version = "0.2.0-alpha4"
+version = "0.2.0-alpha5"
 dependencies = [
  "anyhow",
  "core-foundation",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "keyring-store-memory"
-version = "0.2.0-alpha4"
+version = "0.2.0-alpha5"
 dependencies = [
  "anyhow",
  "keyring-core",
