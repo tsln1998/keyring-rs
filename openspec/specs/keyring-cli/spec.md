@@ -20,10 +20,13 @@ SHALL be rejected. Debug output and parsing diagnostics SHALL not reveal credent
 ### Requirement: Terminal control commands
 
 The default invocation SHALL serve; unlock, refresh, lock, and status SHALL use the same agent socket,
-resolving --path before SSH_AUTH_SOCK. Unlock SHALL read its password without echo from
+resolving --path before SSH_AUTH_SOCK and falling back to the platform's default endpoint.
+Unlock SHALL read its password without echo from
 the terminal, without accepting argv or environment passwords. Status SHALL have stable
 text and JSON forms, escape control characters, and distinguish not-running from locked.
-Exit codes SHALL distinguish usage, connection, state conflict, and authentication failures.
+Successful commands SHALL exit with code 0. Argument parsing SHALL propagate errors directly,
+including explicit help requests. All returned errors, including configuration, connection,
+state conflict, and authentication failures, SHALL exit with code 1.
 
 ### Requirement: Status layout
 
@@ -69,12 +72,18 @@ logging, detect disconnect during unlock, and bound decoded requests plus writes
 ### Requirement: Platform lifecycle
 
 Unix sockets SHALL be 0600 and preserve active sockets, regular files, and symlinks during
-stale-path reclamation. Windows SHALL retain named-pipe support. Unix SIGUSR1 SHALL validate
-configuration before replacement and return successful reloads to locked; invalid reloads
-SHALL preserve the active service. Shutdown SHALL drain for up to 30 seconds and clear stores.
+stale-path reclamation. Windows SHALL retain named-pipe support. Configuration SHALL be loaded
+once at startup; configuration changes SHALL require a service restart. Unix SIGINT and
+SIGTERM SHALL request shutdown. Shutdown SHALL drain for up to 30 seconds and clear stores.
+
+#### Scenario: Configuration changes after startup
+
+- **WHEN** the configuration file is changed or removed after the service starts
+- **THEN** existing connections and control commands continue using the startup configuration.
 
 ### Requirement: Build and assembly
 
-CLI SHALL assemble target-gated platform stores and universal Memory. Nix defaults SHALL
-build the source version, use the keyring executable, and support runtime secret files.
+CLI SHALL construct the concrete Bitwarden provider and pass it to the protocol through
+keyring-core's Provider trait. CLI SHALL assemble target-gated platform stores and universal
+Memory. Nix defaults SHALL build the source version, use the keyring executable, and support runtime secret files.
 Linux release binaries SHALL remain statically linked with musl.

@@ -6,17 +6,37 @@ Provide Linux-only durable Secret Service storage using pure Rust D-Bus.
 
 ## Requirements
 
-### Requirement: Side-effect-free availability probe
+### Requirement: Cached storage availability probe
 
 The probe SHALL connect only to the local session bus, require an existing Secret Service
-owner and an unlocked default collection, cache availability, and never start a daemon
-or request an interactive prompt. D-Bus operations SHALL have bounded timeouts.
+owner and an unlocked default collection, and never start a daemon or request an interactive
+prompt. It SHALL then open a session, create a temporary item without replacing existing
+items, retrieve and compare its Secret, and delete it. Probe items SHALL use a random
+`user` attribute and `server=keyring-rs.probe`, outside normal key listing and cleanup.
+Only a successful write, read, comparison, and deletion SHALL make the backend available.
+The probe SHALL run once per instance through synchronized initialization and cache both
+success and failure, retaining the successful connection and collection. Construction SHALL
+complete the probe; later availability, capability, and storage calls SHALL reuse its result.
+Discovery SHALL have a two-second timeout and the write/read stage an eight-second timeout.
+A known probe item SHALL still receive a deletion attempt after read errors or timeout.
+Deletion and session closing SHALL run outside the write/read deadline with separate
+five-second timeouts. Session closing SHALL be attempted after success and ordinary
+failure without replacing the storage result.
+Storage errors, mismatched bytes, interactive prompts, and deletion failures SHALL report
+PROBE_FAILED; an exceeded probe deadline SHALL report TIMEOUT. Remote timeouts or process
+termination may leave isolated temporary entries and SHALL NOT be described as atomic cleanup.
 
 #### Scenario: No session bus
 
 - **WHEN** the session bus or service is absent
 - **THEN** capabilities report unsupported, reason is NO_SESSION_BUS or NO_SERVICE,
   and the agent can choose Memory.
+
+#### Scenario: Unlocked collection denies storage access
+
+- **WHEN** an existing unlocked collection rejects writing, reading, or deleting a probe item
+- **THEN** capabilities report unsupported, reason is PROBE_FAILED, and subsequent calls
+  reuse the cached failure without retrying.
 
 ### Requirement: Unified software signing
 

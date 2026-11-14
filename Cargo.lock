@@ -383,6 +383,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cbc"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -554,6 +563,20 @@ checksum = "b96a46ad395a5e00676eddaca4a45ed78b29c08be5a878d35e4b071c625637dd"
 dependencies = [
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -777,7 +800,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -918,7 +941,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1016,6 +1039,28 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "garde"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d7f479d28d1daedf23970890723b8774d120aa627abcb33c1d7c93d0965e6c3"
+dependencies = [
+ "compact_str",
+ "garde_derive",
+ "smallvec",
+]
+
+[[package]]
+name = "garde_derive"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b0252cacdca8e6f30a900e6d436fbf294e23f674b9288ca4a5bd35976bef87c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1490,12 +1535,13 @@ dependencies = [
 
 [[package]]
 name = "keyring-cli"
-version = "0.2.0-alpha3"
+version = "0.2.0-alpha4"
 dependencies = [
  "anyhow",
  "bitwarden-crypto",
  "clap",
  "comfy-table",
+ "garde",
  "keyring-core",
  "keyring-protocol",
  "keyring-provider",
@@ -1507,7 +1553,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "serde_path_to_error",
  "signature",
  "ssh-encoding",
  "ssh-key",
@@ -1523,13 +1568,15 @@ dependencies = [
 
 [[package]]
 name = "keyring-core"
-version = "0.2.0-alpha3"
+version = "0.2.0-alpha4"
 dependencies = [
+ "anyhow",
  "ed25519-dalek",
  "rand",
  "rsa",
  "secrecy",
  "serde",
+ "serde_json",
  "sha2",
  "ssh-key",
  "thiserror",
@@ -1538,15 +1585,13 @@ dependencies = [
 
 [[package]]
 name = "keyring-protocol"
-version = "0.2.0-alpha3"
+version = "0.2.0-alpha4"
 dependencies = [
  "anyhow",
  "chrono",
  "keyring-core",
- "keyring-provider",
  "keyring-store-memory",
  "rand",
- "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -1560,10 +1605,11 @@ dependencies = [
 
 [[package]]
 name = "keyring-provider"
-version = "0.2.0-alpha3"
+version = "0.2.0-alpha4"
 dependencies = [
  "anyhow",
  "bitwarden-crypto",
+ "garde",
  "keyring-core",
  "reqwest",
  "rustls",
@@ -1580,8 +1626,9 @@ dependencies = [
 
 [[package]]
 name = "keyring-store-freedesktop"
-version = "0.2.0-alpha3"
+version = "0.2.0-alpha4"
 dependencies = [
+ "anyhow",
  "keyring-core",
  "rand",
  "secrecy",
@@ -1595,8 +1642,9 @@ dependencies = [
 
 [[package]]
 name = "keyring-store-keychain"
-version = "0.2.0-alpha3"
+version = "0.2.0-alpha4"
 dependencies = [
+ "anyhow",
  "core-foundation",
  "keyring-core",
  "rand",
@@ -1611,8 +1659,9 @@ dependencies = [
 
 [[package]]
 name = "keyring-store-memory"
-version = "0.2.0-alpha3"
+version = "0.2.0-alpha4"
 dependencies = [
+ "anyhow",
  "keyring-core",
  "libc",
  "region",
@@ -2128,7 +2177,7 @@ dependencies = [
  "bitflags",
  "libc",
  "mach2",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2271,7 +2320,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2328,7 +2377,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2519,17 +2568,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "serde_path_to_error"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
-dependencies = [
- "itoa",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -2758,6 +2796,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2821,7 +2865,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2882,6 +2926,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -3284,7 +3329,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3560,6 +3605,7 @@ dependencies = [
  "serde_repr",
  "socket2",
  "tokio",
+ "tracing",
  "uds_windows",
  "uuid",
  "windows-sys 0.61.2",
@@ -3719,4 +3765,8 @@ checksum = "23ef5ed7d628cdf0af82f93dfe03330a8e37383bf7422a1d3d6eb72326680be5"
 dependencies = [
  "futures-core",
  "futures-io",
+ "rustix",
+ "socket2",
+ "tracing",
+ "windows-sys 0.61.2",
 ]

@@ -2,34 +2,51 @@
 
 ## Purpose
 
-Define platform-independent storage contracts and the single software signing implementation.
+Define platform-independent provider and storage contracts and the single software signing implementation.
 
 ## Requirements
 
 ### Requirement: Typed key and store contracts
 
-The crate SHALL expose RSA key specifications including their actual bit size, Ed25519,
-opaque store handles, public records, capabilities, and signing
-mode. Secrets SHALL use zeroizing byte containers and SHALL NOT be serializable
+The crate SHALL expose public crypto, keystore, and provider modules without root re-exports.
+The keystore module SHALL expose RSA key specifications including their actual bit size, Ed25519,
+backend-local KeyId values, KeyInfo public metadata, KeyRecord import material, Kind, capabilities,
+and SigningMode. KeyInfo SHALL derive its specification from its public identity rather than store
+a duplicate spec field. Secrets SHALL use SecretBox<[u8]> and SHALL NOT be serializable
 or included in debug output.
 
 #### Scenario: Record round trip
 
 - **WHEN** a backend persists a record
-- **THEN** every public field survives the round trip.
+- **THEN** every public field survives the round trip, with the identity encoded as an OpenSSH
+  public-key string through the private serde::keydata adapter.
 
 ### Requirement: Synchronous store boundary
 
-Every store SHALL implement kind, cached availability, capabilities, load, list, sign,
-delete, and clear. Unavailable stores SHALL advertise no supported specifications.
-Availability reasons SHALL use short uppercase codes with underscores between words,
-defaulting to UNAVAILABLE; available stores SHALL return no reason.
-Duplicate public-key import SHALL return Duplicate.
+The KeyStore trait SHALL provide kind, cached availability, capabilities, load, list, sign,
+delete, and clear. Listing SHALL return pairs of KeyId and KeyInfo.
+Unavailable stores SHALL advertise no supported specifications.
+The available operation SHALL return anyhow::Result<()>, with Ok(()) for an available store.
+Unavailable stores SHALL return errors whose display messages are short uppercase codes with
+underscores between words, using UNAVAILABLE when no more specific reason exists.
+Store operation failures SHALL use keystore::Error; duplicate public-key import SHALL return Duplicate.
 
 #### Scenario: Deleted handle
 
 - **WHEN** a key is deleted or the store cleared
 - **THEN** signing with its old handle fails.
+
+### Requirement: Asynchronous provider boundary
+
+The crate SHALL expose a Send + Sync Provider trait with an object-safe asynchronous load
+operation. Each load SHALL consume a zeroizing password and return owned KeyRecord values.
+Provider failures SHALL use provider::Error, distinguish authentication from snapshot-loading failures, and expose
+safe display messages while retaining source context for diagnostics.
+
+#### Scenario: Provider injection
+
+- **WHEN** the application supplies a Provider implementation to the protocol
+- **THEN** the protocol can load keys without depending on the concrete provider crate.
 
 ### Requirement: Shared cryptographic implementation
 

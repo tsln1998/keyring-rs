@@ -8,7 +8,9 @@ version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Workspace dependencies
+anyhow.workspace = true
 keyring-core.workspace = true
+rand.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
 ssh-key.workspace = true
@@ -35,8 +37,18 @@ zbus.features = [
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # Workspace dependencies
-rand.workspace = true
 signature.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+
+# Features
+tokio.features = [
+  "macros",
+]
+zbus.features = [
+  "p2p",
+  "service",
+]
 
 [lints]
 workspace = true

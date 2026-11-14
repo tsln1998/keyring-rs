@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 # Workspace dependencies
+anyhow.workspace = true
 ed25519-dalek.workspace = true
 rsa.workspace = true
 secrecy.workspace = true
@@ -33,6 +34,7 @@ ssh-key.features = [
 [dev-dependencies]
 # Workspace dependencies
 rand.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

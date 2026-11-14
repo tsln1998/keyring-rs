@@ -11,9 +11,8 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use bitwarden_crypto::KeyStore;
-use keyring_core::SecrecyBytes;
 use reqwest::{Client, StatusCode};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretBox};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -37,7 +36,7 @@ impl BitwardenSession {
     ///
     /// Network timeouts cover requests, not the blocking KDF. Once the blocking closure starts,
     /// cancelling the awaiting future does not interrupt it or immediately release its inputs.
-    pub(crate) async fn unlock(config: BitwardenConfig, password: SecrecyBytes) -> Result<Self> {
+    pub(crate) async fn unlock(config: BitwardenConfig, password: SecretBox<[u8]>) -> Result<Self> {
         let client = Client::builder()
             .user_agent("keyring-rs")
             .connect_timeout(Duration::from_secs(5))

@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 # Workspace dependencies
+anyhow.workspace = true
 keyring-core.workspace = true
 region.workspace = true
 secrecy.workspace = true

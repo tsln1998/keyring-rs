@@ -6,6 +6,12 @@ Load SSH materials from one Bitwarden account with operation-scoped credentials 
 
 ## Requirements
 
+### Requirement: Concrete provider construction
+
+BitwardenProvider SHALL implement the Provider trait from keyring-core. Construction SHALL
+validate and retain configuration without authentication or sync. Each explicit load SHALL
+create a fresh account session using the supplied password.
+
 ### Requirement: Explicit password bootstrap
 
 The crate SHALL accept a zeroizing password only at unlock, use API-key client credentials,

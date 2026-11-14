@@ -9,7 +9,7 @@ context: |
   [bitwarden] table with API credentials and no master password.
 
   Workspace:
-  - keyring-core: synchronous Store contracts, public metadata, shared software signing.
+  - keyring-core: asynchronous Provider and synchronous Store contracts, public metadata, shared software signing.
   - keyring-provider: Bitwarden authentication, account crypto, sync and SSH material decryption.
   - keyring-protocol: SSH-agent messages with ssh-encoding and ssh-key, lifecycle, selection, reconciliation, control extensions.
   - keyring-store-memory: ephemeral storage and software signing.
@@ -20,12 +20,13 @@ context: |
   Architecture:
   - Core has no runtime, network, or platform dependencies.
   - Backends depend on core, never on provider, protocol, or ssh-agent-lib.
-  - Protocol depends on core and provider, never on concrete store crates.
-  - CLI selects platform crates with target dependencies, without backend features.
+  - Protocol depends on core contracts, never on concrete provider or store crates.
+  - CLI constructs providers and selects platform crates with target dependencies, without backend features.
   - Fixed per-key store priority is Keychain > FreeDesktop > Memory.
   - Every backend implements sign; protocol retains only public records and opaque handles.
   - Bitwarden sessions, tokens, and account crypto exist only for a single explicit load.
   - The service never refreshes automatically or contacts Bitwarden for SSH requests or status.
+  - Configuration is loaded once at startup; applying configuration changes requires a restart.
   - Refresh composes existing lock and unlock extensions; there is no server refresh operation.
   - Ed25519 always uses software signing. Linux has no hardware signing backend.
   - Imported Keychain RSA uses platform signing; hardware execution is not guaranteed.
@@ -34,7 +35,7 @@ context: |
 
   Prefer explicit boundaries, typed data, conservative logging, zeroized secret buffers,
   transactional state changes, independent signature verification, and minimal dependencies.
-  Preserve Windows pipes, Unix reload/drain, per-request deadlines, and static musl releases.
+  Preserve Windows pipes, Unix shutdown/drain, per-request deadlines, and static musl releases.
   Do not claim real platform security properties based on mock tests.
 
 rules:

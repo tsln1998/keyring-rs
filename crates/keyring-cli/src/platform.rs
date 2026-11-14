@@ -20,7 +20,7 @@ use std::mem::size_of;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::Duration;
 #[cfg(windows)]
@@ -119,31 +119,20 @@ pub struct Listener {
     path: PathBuf,
 }
 
-/// Control event received by the foreground service.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SignalEvent {
-    /// Re-read configuration while keeping the current agent if parsing fails.
-    Reload,
-    /// Stop accepting clients and begin connection draining and store cleanup.
-    Shutdown,
-}
-
-/// Windows console events that all request service shutdown.
-#[cfg(windows)]
+/// Platform notifications that request service shutdown.
 #[derive(Debug)]
 pub struct Signal {
+    #[cfg(windows)]
     interrupt: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
     close: tokio::signal::windows::CtrlClose,
+    #[cfg(windows)]
     shutdown: tokio::signal::windows::CtrlShutdown,
+    #[cfg(windows)]
     ctrl_break: tokio::signal::windows::CtrlBreak,
-}
-
-/// Unix signal subscriptions for configuration reload and process termination.
-#[cfg(unix)]
-#[derive(Debug)]
-pub struct Signal {
-    reload: tokio::signal::unix::Signal,
+    #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
 }
 
@@ -191,82 +180,72 @@ impl Listener {
         info!(path = %path, "binding unix socket listener");
 
         let path = PathBuf::from(path);
-        let inner = bind_unix(&path).await?;
+        let inner = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(bind_error) if bind_error.kind() == io::ErrorKind::AddrInUse => {
+                'reclaim: {
+                    // Inspect the directory entry itself, so a symlink is never followed during reclamation.
+                    let original = match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.file_type().is_socket() => metadata,
+                        Ok(_) => return Err(bind_error.into()),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => break 'reclaim,
+                        Err(error) => {
+                            debug!(path = %path.display(), error = ?error, "failed to inspect occupied unix socket path");
+                            return Err(bind_error.into());
+                        }
+                    };
+
+                    // Only connection refusal establishes staleness; timeout or other errors are inconclusive.
+                    match timeout(Duration::from_secs(1), UnixStream::connect(&path)).await {
+                        Ok(Ok(stream)) => {
+                            drop(stream);
+                            return Err(bind_error.into());
+                        }
+                        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                        Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => break 'reclaim,
+                        Ok(Err(error)) => {
+                            debug!(path = %path.display(), error = ?error, "unix socket probe was inconclusive");
+                            return Err(bind_error.into());
+                        }
+                        Err(error) => {
+                            debug!(path = %path.display(), error = ?error, "unix socket probe timed out");
+                            return Err(bind_error.into());
+                        }
+                    }
+
+                    let current = match fs::symlink_metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => break 'reclaim,
+                        Err(error) => {
+                            debug!(path = %path.display(), error = ?error, "failed to recheck stale unix socket path");
+                            return Err(bind_error.into());
+                        }
+                    };
+
+                    // Rechecking device and inode narrows the race with another process replacing this path.
+                    if !current.file_type().is_socket()
+                        || original.dev() != current.dev()
+                        || original.ino() != current.ino()
+                    {
+                        debug!(path = %path.display(), "unix socket path changed during stale-socket probe");
+                        return Err(bind_error.into());
+                    }
+
+                    warn!(path = %path.display(), "removing stale unix socket path");
+                    match fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                UnixListener::bind(&path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
         // Ordinary socket clients must run as the owner; permissions do not encrypt payloads.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
         Ok(Self { inner, path })
-    }
-}
-
-/// Binds normally, retrying only when an occupied path can be identified as a stale socket.
-#[cfg(unix)]
-async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
-    match UnixListener::bind(path) {
-        Ok(listener) => Ok(listener),
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            if reclaim_stale_socket(path).await? {
-                UnixListener::bind(path)
-            } else {
-                Err(error)
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// Reclaims a refused socket conservatively, preserving live, non-socket, or ambiguous paths.
-#[cfg(unix)]
-async fn reclaim_stale_socket(path: &Path) -> io::Result<bool> {
-    // Inspect the directory entry itself, so a symlink is never followed during reclamation.
-    let original = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => metadata,
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => {
-            debug!(path = %path.display(), error = ?error, "failed to inspect occupied unix socket path");
-            return Ok(false);
-        }
-    };
-
-    // Only connection refusal establishes staleness; timeout or other errors are inconclusive.
-    match timeout(Duration::from_secs(1), UnixStream::connect(path)).await {
-        Ok(Ok(stream)) => {
-            drop(stream);
-            return Ok(false);
-        }
-        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {}
-        Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Ok(Err(error)) => {
-            debug!(path = %path.display(), error = ?error, "unix socket probe was inconclusive");
-            return Ok(false);
-        }
-        Err(error) => {
-            debug!(path = %path.display(), error = ?error, "unix socket probe timed out");
-            return Ok(false);
-        }
-    }
-
-    let current = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => {
-            debug!(path = %path.display(), error = ?error, "failed to recheck stale unix socket path");
-            return Ok(false);
-        }
-    };
-
-    // Rechecking device and inode narrows the race with another process replacing this path.
-    if !current.file_type().is_socket() || original.dev() != current.dev() || original.ino() != current.ino() {
-        debug!(path = %path.display(), "unix socket path changed during stale-socket probe");
-        return Ok(false);
-    }
-
-    warn!(path = %path.display(), "removing stale unix socket path");
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error),
     }
 }
 
@@ -314,15 +293,33 @@ impl Signal {
         })
     }
 
-    /// Maps any subscribed console notification to shutdown; Windows has no reload event here.
-    pub async fn recv(&mut self) -> SignalEvent {
+    /// Waits for any subscribed console notification to request shutdown.
+    pub async fn recv(&mut self) {
         tokio::select! {
             _ = self.interrupt.recv() => {},
             _ = self.close.recv() => {},
             _ = self.shutdown.recv() => {},
             _ = self.ctrl_break.recv() => {},
         }
-        SignalEvent::Shutdown
+    }
+}
+
+#[cfg(unix)]
+impl Signal {
+    /// Subscribes to SIGINT and SIGTERM shutdowns.
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// Waits for a subscribed Unix signal to request shutdown.
+    pub async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
+        }
     }
 }
 
@@ -417,26 +414,5 @@ mod tests {
 
         assert!(!path.exists());
         Ok(())
-    }
-}
-
-#[cfg(unix)]
-impl Signal {
-    /// Subscribes to SIGUSR1 reloads and SIGINT or SIGTERM shutdowns.
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            reload: signal(SignalKind::user_defined1())?,
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
-        })
-    }
-
-    /// Waits for one subscribed Unix signal and translates it to a lifecycle event.
-    pub async fn recv(&mut self) -> SignalEvent {
-        tokio::select! {
-            _ = self.reload.recv() => SignalEvent::Reload,
-            _ = self.interrupt.recv() => SignalEvent::Shutdown,
-            _ = self.terminate.recv() => SignalEvent::Shutdown,
-        }
     }
 }

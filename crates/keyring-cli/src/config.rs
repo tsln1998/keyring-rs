@@ -1,15 +1,18 @@
 //! Strict service configuration loading with source text kept out of diagnostics.
 
 use anyhow::{Context, Result};
+use garde::Validate;
 use keyring_provider::config::BitwardenConfig;
 use serde::Deserialize;
 use std::{fs, path::Path};
+use toml::de::Deserializer;
 use zeroize::Zeroizing;
 
 /// The single provider configuration accepted by the foreground service.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[garde(dive)]
     pub bitwarden: BitwardenConfig,
 }
 
@@ -18,12 +21,9 @@ impl Config {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         // The source contains API credentials; wipe this owned text buffer when it is dropped.
         let source = Zeroizing::new(fs::read_to_string(path.as_ref()).context("failed to read configuration")?);
-        let deserializer =
-            toml::de::Deserializer::parse(&source).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
-        // Full parser errors can quote source fragments, so retain only the failing field path.
-        let config: Self = serde_path_to_error::deserialize(deserializer)
-            .map_err(|error| anyhow::anyhow!("invalid configuration at {}", error.path()))?;
-        config.bitwarden.validate()?;
+        let deserializer = Deserializer::parse(&source).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+        let config = Config::deserialize(deserializer).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+        config.validate()?;
         Ok(config)
     }
 }
@@ -46,7 +46,7 @@ mod tests {
         );
         let config: Config = toml::from_str(&source)?;
         for config in [config.clone(), config] {
-            config.bitwarden.validate()?;
+            config.validate()?;
             assert_eq!(config.bitwarden.client_secret.as_str(), "fixture-secret-never-in-debug");
             assert!(!format!("{config:?}").contains("fixture-secret-never-in-debug"));
         }
@@ -62,6 +62,40 @@ mod tests {
             let source = VALID.replace("client_secret='secret'", &format!("client_secret={secret}"));
             writeln!(file, "{source}")?;
             let error = Config::new(file.path()).expect_err("invalid client_secret must be rejected");
+            assert!(!format!("{error:#?}").contains("do-not-log-this"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validation_errors_include_nested_paths_without_source_values() -> Result<()> {
+        use std::io::Write;
+        for (original, replacement, path) in [
+            (
+                "api_url='https://api.example'",
+                "api_url='https://do-not-log-this@api.example'",
+                "bitwarden.api_url",
+            ),
+            (
+                "identity_url='https://identity.example'",
+                "identity_url='https://identity.example/#do-not-log-this'",
+                "bitwarden.identity_url",
+            ),
+            ("client_id='id'", "client_id='   '", "bitwarden.client_id"),
+            (
+                "client_secret='secret'",
+                "client_secret='   '",
+                "bitwarden.client_secret",
+            ),
+        ] {
+            let source = VALID
+                .replace(original, replacement)
+                .replace("client_id='id'", "client_id='do-not-log-this'")
+                .replace("client_secret='secret'", "client_secret='do-not-log-this'");
+            let mut file = tempfile::NamedTempFile::new()?;
+            writeln!(file, "{source}")?;
+            let error = Config::new(file.path()).expect_err("invalid configuration must be rejected");
+            assert!(error.to_string().contains(path));
             assert!(!format!("{error:#?}").contains("do-not-log-this"));
         }
         Ok(())

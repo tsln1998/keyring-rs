@@ -10,6 +10,7 @@ version.workspace = true
 # Workspace dependencies
 anyhow.workspace = true
 bitwarden-crypto.workspace = true
+garde.workspace = true
 keyring-core.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
@@ -26,6 +27,9 @@ zeroize.workspace = true
 reqwest.default-features = false
 
 # Features
+garde.features = [
+  "derive",
+]
 reqwest.features = [
   "form",
   "query",

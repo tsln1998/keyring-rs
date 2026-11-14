@@ -4,7 +4,7 @@
 //! zeroized on drop because unlock extensions contain the user's master password.
 
 use anyhow::{Context, Result, bail};
-use keyring_protocol::wire::{Request, Response};
+use keyring_protocol::codec::{Request, Response};
 use ssh_encoding::{Decode, Encode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
@@ -80,7 +80,7 @@ mod tests {
             }
             Ok::<_, std::io::Error>(())
         });
-        assert!(matches!(read_request(&mut reader).await?, Request::RequestIdentities));
+        assert!(matches!(read_request(&mut reader).await?, Request::Identities));
         sender.await??;
         let (mut reader, mut writer) = duplex(64);
         writer.write_u32((MAX_PACKET + 1) as u32).await?;

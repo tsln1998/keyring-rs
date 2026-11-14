@@ -4,31 +4,19 @@
 //! socket or named pipe without transport encryption; access depends on OS endpoint permissions.
 
 use crate::protocol;
+use anyhow::{Context, Result, bail, ensure};
 use comfy_table::{Table, presets::NOTHING};
-use keyring_core::{SigningMode, StoreKind};
-use keyring_protocol::control::{self, Outcome, Phase, Status};
-use keyring_protocol::wire::{Extension, Request, Response};
+use keyring_core::keystore::SigningMode;
+use keyring_protocol::codec::{Request, Response};
+use keyring_protocol::control;
 use std::time::Duration;
 use tokio::time::timeout;
-use zeroize::Zeroizing;
 
 /// Operations represented by individual service control extensions.
 pub enum Action {
     Unlock,
     Lock,
     Status { json: bool },
-}
-
-/// Refreshes by completing lock first, then reconnecting and prompting for a fresh unlock.
-///
-/// The client reuses neither the connection nor the previous password. The protocol
-/// has no separate refresh operation.
-pub async fn refresh(path: &str) -> u8 {
-    let result = run(path, Action::Lock).await;
-    if result != 0 {
-        return result;
-    }
-    run(path, Action::Unlock).await
 }
 
 /// Opens the existing local SSH-agent socket; the caller supplies the connection deadline.
@@ -49,11 +37,8 @@ async fn connect(path: &str) -> std::io::Result<tokio::net::windows::named_pipe:
     }
 }
 
-/// Executes one control exchange and converts its outcome into a CLI exit code.
-///
-/// An unavailable endpoint returns 3, busy state returns 4, and authentication failure
-/// returns 5. Usage errors return 2; other operational failures return 1.
-pub async fn run(path: &str, action: Action) -> u8 {
+/// Executes one control exchange, returning transport and service failures to the caller.
+pub async fn run(path: &str, action: Action) -> Result<()> {
     let mut stream = match timeout(Duration::from_secs(10), connect(path)).await {
         Ok(Ok(stream)) => stream,
         _ => {
@@ -66,95 +51,55 @@ pub async fn run(path: &str, action: Action) -> u8 {
                     summary.add_row(["SOCKET", &escape(path)]);
                     println!("{}", render_table(summary));
                 }
-            } else {
-                eprintln!("cannot connect to agent at {path}");
             }
-            return 3;
+            bail!("cannot connect to agent at {path}");
         }
     };
-    let (name, details) = match action {
+    let request = match action {
         Action::Unlock => {
             // Terminal input can block, so keep it off the async worker threads.
-            let password = match tokio::task::spawn_blocking(|| {
-                rpassword::prompt_password("Password: ").map(|password| Zeroizing::new(password.into_bytes()))
+            tokio::task::spawn_blocking(|| {
+                rpassword::prompt_password("Password: ")
+                    .map(|password| control::Request::Unlock(password.into_bytes().into_boxed_slice().into()))
             })
-            .await
-            {
-                Ok(Ok(password)) => password,
-                _ => {
-                    eprintln!("failed to read password from terminal");
-                    return 1;
-                }
-            };
-            (control::UNLOCK, password)
+            .await?
+            .context("failed to read password from terminal")?
         }
-        Action::Lock => (control::LOCK, Zeroizing::new(Vec::new())),
-        Action::Status { .. } => (control::STATUS, Zeroizing::new(Vec::new())),
+        Action::Lock => control::Request::Lock,
+        Action::Status { .. } => control::Request::Status,
     };
+    let name = request.name();
     // Unlock includes remote authentication, KDF work, decryption, and backend import.
     let budget = if name == control::UNLOCK { 180 } else { 10 };
-    let result = timeout(Duration::from_secs(budget), async {
-        let request = Request::Extension(Extension {
-            name: name.into(),
-            details: details.to_vec().into(),
-        });
+    let bytes = timeout(Duration::from_secs(budget), async {
+        let request = Request::from(request);
         protocol::write(&mut stream, &request).await?;
-        // Release both owned payload copies before waiting for the service's response.
+        // Release the owned payload before waiting for the service's response.
         drop(request);
-        drop(details);
-        let Response::ExtensionResponse(response) = protocol::read_response(&mut stream).await? else {
-            anyhow::bail!("agent rejected control extension");
+        let Response::Extension(Some((response_name, response_details))) = protocol::read_response(&mut stream).await?
+        else {
+            bail!("agent rejected control extension");
         };
-        if response.name != name {
-            anyhow::bail!("unexpected agent extension response");
-        }
-        Ok::<_, anyhow::Error>(response.details)
+        ensure!(response_name == name, "unexpected agent extension response");
+        Ok::<_, anyhow::Error>(response_details)
     })
-    .await;
-    let bytes = match result {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => {
-            eprintln!("{error}");
-            return 1;
-        }
-        Err(_) => {
-            eprintln!("agent request timed out");
-            return 1;
-        }
-    };
-    if let Action::Status { json } = action {
-        let status: Status = match serde_json::from_slice(&bytes) {
-            Ok(status) => status,
-            Err(_) => {
-                eprintln!("invalid agent status response");
-                return 1;
+    .await
+    .context("agent request timed out")??;
+    let response: control::Response = serde_json::from_slice(&bytes).context("invalid agent control response")?;
+    match (action, response) {
+        (Action::Status { json }, response @ control::Response::Status { .. }) => {
+            if json {
+                let mut output = serde_json::to_value(&response)?;
+                output["socket"] = path.into();
+                println!("{output}");
+            } else {
+                print!("{}", render(&response)?);
             }
-        };
-        if json {
-            let mut output = serde_json::to_value(&status).expect("status is serializable");
-            output["socket"] = path.into();
-            println!("{output}");
-        } else {
-            print!("{}", render(&status));
+            Ok(())
         }
-        return 0;
-    }
-    let outcome: Outcome = match serde_json::from_slice(&bytes) {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            eprintln!("invalid agent control response");
-            return 1;
-        }
-    };
-    if outcome.ok {
-        return 0;
-    }
-    eprintln!("{}", outcome.message.as_deref().unwrap_or("agent operation failed"));
-    match outcome.code.as_deref() {
-        Some("busy" | "already-unlocked") => 4,
-        Some("auth") => 5,
-        Some("usage") => 2,
-        _ => 1,
+        (_, control::Response::Failure { message, .. }) => bail!("{message}"),
+        (Action::Unlock | Action::Lock, control::Response::Success) => Ok(()),
+        _ => bail!("unexpected agent control response"),
     }
 }
 
@@ -183,38 +128,51 @@ fn render_table(mut table: Table) -> String {
 }
 
 /// Renders the service's snapshot and backend sequence without inventing or sorting stores.
-pub fn render(status: &Status) -> String {
-    let phase = match status.state {
-        Phase::Locked => "LOCKED",
-        Phase::Loading => "LOADING",
-        Phase::Unlocked => "UNLOCKED",
+pub fn render(response: &control::Response) -> Result<String> {
+    let control::Response::Status {
+        state,
+        snapshot,
+        stores,
+        keys,
+    } = response
+    else {
+        bail!("expected agent status response");
+    };
+    let label = match state {
+        control::State::Locked => "LOCKED",
+        control::State::Loading => "LOADING",
+        control::State::Unlocked => "UNLOCKED",
     };
     let mut summary = Table::new();
-    summary.add_row(["STATUS", phase]);
-    if status.state == Phase::Unlocked
-        && let Some(snapshot) = &status.snapshot
+    summary.add_row(["STATUS", label]);
+    if *state == control::State::Unlocked
+        && let Some(snapshot) = snapshot
     {
         summary.add_row(["SNAPSHOT", &snapshot.loaded_at]);
     }
     let mut sections = vec![render_table(summary)];
-    if !status.stores.is_empty() {
-        let mut stores = Table::new();
-        stores.set_header(["STORE", "STATE"]);
+    if !stores.is_empty() {
+        let mut table = Table::new();
+        table.set_header(["STORE", "STATE"]);
         // The server owns backend ordering and supplies short uppercase failure reasons.
-        for store in &status.stores {
+        for store in stores {
             let state = if store.available {
                 "OK"
             } else {
                 store.reason.as_deref().unwrap_or("UNAVAILABLE")
             };
-            stores.add_row([store_name(store.kind), &escape(state)]);
+            let kind = serde_json::to_value(store.kind)?;
+            table.add_row([
+                kind.as_str().context("store kind must serialize as a string")?,
+                &escape(state),
+            ]);
         }
-        sections.push(render_table(stores));
+        sections.push(render_table(table));
     }
-    if status.state == Phase::Unlocked && !status.keys.is_empty() {
-        let mut keys = Table::new();
-        keys.set_header(["FINGERPRINT", "ALGORITHM", "STORE", "SIGNING", "COMMENT"]);
-        for key in &status.keys {
+    if *state == control::State::Unlocked && !keys.is_empty() {
+        let mut table = Table::new();
+        table.set_header(["FINGERPRINT", "ALGORITHM", "STORE", "SIGNING", "COMMENT"]);
+        for key in keys {
             let algorithm = key
                 .bits
                 .map_or_else(|| key.algorithm.clone(), |bits| format!("rsa-{bits}"));
@@ -222,26 +180,18 @@ pub fn render(status: &Status) -> String {
                 SigningMode::Platform => "platform",
                 SigningMode::Software => "software",
             };
-            keys.add_row([
+            let store = serde_json::to_value(key.store)?;
+            table.add_row([
                 key.fingerprint.as_str(),
                 &algorithm,
-                store_name(key.store),
+                store.as_str().context("store kind must serialize as a string")?,
                 signing,
                 &escape(&key.comment),
             ]);
         }
-        sections.push(render_table(keys));
+        sections.push(render_table(table));
     }
-    format!("{}\n", sections.join("\n\n"))
-}
-
-/// Supplies the stable lowercase backend names used in the terminal display.
-fn store_name(kind: StoreKind) -> &'static str {
-    match kind {
-        StoreKind::Keychain => "keychain",
-        StoreKind::FreeDesktop => "freedesktop",
-        StoreKind::Memory => "memory",
-    }
+    Ok(format!("{}\n", sections.join("\n\n")))
 }
 
 #[cfg(test)]
@@ -249,27 +199,104 @@ mod tests {
     //! Presentation boundaries for locked state and untrusted terminal text.
 
     use super::*;
+    use keyring_core::keystore::Kind;
 
     /// Omits the key table unless a snapshot is unlocked and contains keys.
     #[test]
-    fn locked_and_loading_have_no_key_table() {
-        for (phase, expected) in [
-            (Phase::Locked, "STATUS  LOCKED\n"),
-            (Phase::Loading, "STATUS  LOADING\n"),
+    fn locked_and_loading_have_no_key_table() -> Result<()> {
+        for (state, expected) in [
+            (control::State::Locked, "STATUS  LOCKED\n"),
+            (control::State::Loading, "STATUS  LOADING\n"),
         ] {
-            let status = Status {
-                state: phase,
+            let response = control::Response::Status {
+                state,
                 snapshot: None,
                 stores: Vec::new(),
                 keys: Vec::new(),
             };
-            assert_eq!(render(&status), expected);
+            assert_eq!(render(&response)?, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn store_names_use_serde_labels_without_quotes() -> Result<()> {
+        for (kind, expected) in [
+            (Kind::Keychain, "keychain"),
+            (Kind::FreeDesktop, "freedesktop"),
+            (Kind::Memory, "memory"),
+        ] {
+            let response = control::Response::Status {
+                state: control::State::Unlocked,
+                snapshot: None,
+                stores: vec![control::Store {
+                    kind,
+                    available: true,
+                    reason: None,
+                }],
+                keys: vec![control::Key {
+                    fingerprint: "SHA256:fixture".into(),
+                    comment: "fixture".into(),
+                    algorithm: "ed25519".into(),
+                    bits: None,
+                    store: kind,
+                    signing: SigningMode::Software,
+                }],
+            };
+            let rendered = render(&response)?;
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.split_whitespace().eq([expected, "OK"]))
+            );
+            assert!(rendered.lines().any(|line| {
+                line.split_whitespace()
+                    .eq(["SHA256:fixture", "ed25519", expected, "software", "fixture"])
+            }));
+        }
+        Ok(())
     }
 
     /// Escapes row separators, terminal escapes, and backslashes without interpreting them.
     #[test]
     fn comments_cannot_inject_rows_or_terminal_controls() {
         assert_eq!(escape("a\nb\tc\r\u{1b}\\"), "a\\nb\\tc\\r\\u001b\\\\");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_failures_return_errors() -> Result<()> {
+        for code in ["busy", "already-unlocked", "auth", "usage"] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("agent.sock");
+            let listener = tokio::net::UnixListener::bind(&path)?;
+            let fixture = async move {
+                let (mut stream, _) = listener.accept().await?;
+                drop(listener);
+                let Request::Extension { name, .. } = protocol::read_request(&mut stream).await? else {
+                    bail!("expected a control request");
+                };
+                assert_eq!(name, control::LOCK);
+                protocol::write(
+                    &mut stream,
+                    &Response::Extension(Some((
+                        name,
+                        serde_json::to_vec(&control::Response::failure(code, "fixture lock failure"))?.into(),
+                    ))),
+                )
+                .await
+            };
+            let path = path.to_str().context("invalid fixture socket path")?;
+            let (served, result) = timeout(Duration::from_secs(5), async {
+                tokio::join!(fixture, run(path, Action::Lock))
+            })
+            .await?;
+            served?;
+            assert_eq!(
+                result.expect_err("service failure must return an error").to_string(),
+                "fixture lock failure"
+            );
+        }
+        Ok(())
     }
 }

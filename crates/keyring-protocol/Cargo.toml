@@ -11,7 +11,6 @@ version.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 keyring-core.workspace = true
-keyring-provider.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -40,24 +39,21 @@ ssh-key.features = [
   "rsa",
 ]
 tokio.features = [
-  "macros",
-  "rt-multi-thread",
+  "rt",
   "sync",
-  "time",
 ]
 
 [dev-dependencies]
 # Workspace dependencies
 keyring-store-memory.workspace = true
 rand.workspace = true
-rustls.workspace = true
-
-# Default features
-rustls.default-features = false
+tokio.workspace = true
 
 # Features
-rustls.features = [
-  "ring",
+tokio.features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
 ]
 
 [lints]

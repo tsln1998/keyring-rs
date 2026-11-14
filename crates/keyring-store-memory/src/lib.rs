@@ -5,8 +5,8 @@
 //! ordinary core dumps. These measures do not prevent arbitrary process reads.
 
 use keyring_core::{
-    Capabilities, KeySpec, SigningMode, Store, StoreError, StoreHandle, StoreKind, StoreMaterial, StoreRecord,
-    StoredKey, software,
+    crypto,
+    keystore::{Capabilities, Error, KeyId, KeyInfo, KeyRecord, KeySpec, KeyStore, Kind, SigningMode},
 };
 use region::{Allocation, LockGuard, Protection};
 use secrecy::ExposeSecret;
@@ -24,12 +24,12 @@ pub struct MemoryStore {
 #[derive(Default)]
 struct State {
     next: u64,
-    keys: HashMap<StoreHandle, ProtectedMaterial>,
+    keys: HashMap<KeyId, ProtectedMaterial>,
 }
 
 /// Owns private pages; `length` excludes page padding, which must also be wiped.
 struct ProtectedMaterial {
-    record: StoreRecord,
+    info: KeyInfo,
     /// Field order releases the lock before its allocation is freed.
     _lock: Option<LockGuard>,
     secret: Allocation,
@@ -42,10 +42,10 @@ unsafe impl Send for ProtectedMaterial {}
 
 impl ProtectedMaterial {
     /// Copies imported bytes into dedicated pages on every supported platform.
-    fn new(material: StoreMaterial) -> Result<Self, StoreError> {
+    fn new(material: KeyRecord) -> Result<Self, Error> {
         let length = material.secret.expose_secret().len();
         let mut secret = region::alloc(length, Protection::READ_WRITE)
-            .map_err(|error| StoreError::Backend(format!("cannot allocate private key memory: {error}")))?;
+            .map_err(|error| Error::Backend(format!("cannot allocate private key memory: {error}")))?;
         let lock = region::lock(secret.as_ptr::<u8>(), secret.len()).ok();
         #[cfg(target_os = "linux")]
         unsafe {
@@ -57,7 +57,7 @@ impl ProtectedMaterial {
             std::ptr::copy_nonoverlapping(material.secret.expose_secret().as_ptr(), secret.as_mut_ptr(), length);
         }
         Ok(Self {
-            record: material.record,
+            info: material.info,
             _lock: lock,
             secret,
             length,
@@ -81,12 +81,12 @@ impl Drop for ProtectedMaterial {
     }
 }
 
-impl Store for MemoryStore {
-    fn kind(&self) -> StoreKind {
-        StoreKind::Memory
+impl KeyStore for MemoryStore {
+    fn kind(&self) -> Kind {
+        Kind::Memory
     }
-    fn available(&self) -> bool {
-        true
+    fn available(&self) -> anyhow::Result<()> {
+        Ok(())
     }
     fn capabilities(&self, _: &KeySpec) -> Capabilities {
         Capabilities {
@@ -94,71 +94,65 @@ impl Store for MemoryStore {
             signing: SigningMode::Software,
         }
     }
-    fn load(&self, material: StoreMaterial) -> Result<StoreHandle, StoreError> {
-        software::validate(&material)?;
+    fn load(&self, record: KeyRecord) -> Result<KeyId, Error> {
+        crypto::validate(&record)?;
         let mut state = self
             .state
             .lock()
-            .map_err(|_| StoreError::Backend("memory lock poisoned".into()))?;
-        if state
-            .keys
-            .values()
-            .any(|key| key.record.identity == material.record.identity)
-        {
-            return Err(StoreError::Duplicate);
+            .map_err(|_| Error::Backend("memory lock poisoned".into()))?;
+        if state.keys.values().any(|key| key.info.identity == record.info.identity) {
+            return Err(Error::Duplicate);
         }
         // Never recycle a deleted handle within this store instance: a stale handle
         // must not start referring to a later import.
         state.next = state
             .next
             .checked_add(1)
-            .ok_or_else(|| StoreError::Backend("handle space exhausted".into()))?;
-        let handle = StoreHandle(state.next.to_be_bytes().to_vec());
-        state.keys.insert(handle.clone(), ProtectedMaterial::new(material)?);
+            .ok_or_else(|| Error::Backend("handle space exhausted".into()))?;
+        let handle = KeyId(state.next.to_be_bytes().to_vec());
+        state.keys.insert(handle.clone(), ProtectedMaterial::new(record)?);
         Ok(handle)
     }
-    fn list(&self) -> Result<Vec<StoredKey>, StoreError> {
+    fn list(&self) -> Result<Vec<(KeyId, KeyInfo)>, Error> {
         let state = self
             .state
             .lock()
-            .map_err(|_| StoreError::Backend("memory lock poisoned".into()))?;
+            .map_err(|_| Error::Backend("memory lock poisoned".into()))?;
         Ok(state
             .keys
             .iter()
-            .map(|(handle, key)| StoredKey {
-                handle: handle.clone(),
-                record: key.record.clone(),
-            })
+            .map(|(handle, key)| (handle.clone(), key.info.clone()))
             .collect())
     }
-    fn sign(&self, handle: &StoreHandle, algorithm: Algorithm, data: &[u8]) -> Result<Vec<u8>, StoreError> {
+    fn sign(&self, handle: &KeyId, algorithm: Algorithm, data: &[u8]) -> Result<Vec<u8>, Error> {
         // Keep the mutex guard through signing so delete/clear cannot drop the
         // mapping while the signer borrows its private bytes.
         let state = self
             .state
             .lock()
-            .map_err(|_| StoreError::Backend("memory lock poisoned".into()))?;
-        let key = state.keys.get(handle).ok_or(StoreError::NotFound)?;
-        if !software::supports_algorithm(&key.record.spec, &algorithm) {
-            return Err(StoreError::Unsupported);
+            .map_err(|_| Error::Backend("memory lock poisoned".into()))?;
+        let key = state.keys.get(handle).ok_or(Error::NotFound)?;
+        let spec: KeySpec = (&key.info.identity).try_into().map_err(|_| Error::Unsupported)?;
+        if !spec.supports(&algorithm) {
+            return Err(Error::Unsupported);
         }
-        software::sign(key.bytes(), algorithm, data)
+        crypto::sign(key.bytes(), algorithm, data)
     }
-    fn delete(&self, handle: &StoreHandle) -> Result<(), StoreError> {
+    fn delete(&self, handle: &KeyId) -> Result<(), Error> {
         // Removing the owning value immediately runs its private-byte cleanup.
         self.state
             .lock()
-            .map_err(|_| StoreError::Backend("memory lock poisoned".into()))?
+            .map_err(|_| Error::Backend("memory lock poisoned".into()))?
             .keys
             .remove(handle)
-            .ok_or(StoreError::NotFound)?;
+            .ok_or(Error::NotFound)?;
         Ok(())
     }
-    fn clear(&self) -> Result<(), StoreError> {
+    fn clear(&self) -> Result<(), Error> {
         // Dropping every value releases the keys without resetting the handle sequence.
         self.state
             .lock()
-            .map_err(|_| StoreError::Backend("memory lock poisoned".into()))?
+            .map_err(|_| Error::Backend("memory lock poisoned".into()))?
             .keys
             .clear();
         Ok(())
@@ -168,6 +162,7 @@ impl Store for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::SecretBox;
     use ssh_key::{PrivateKey, private::Ed25519Keypair};
 
     #[test]
@@ -175,8 +170,8 @@ mod tests {
         let expected = (0..region::page::size() + 7)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let mut material = software::material(&PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32])))?;
-        material.secret = keyring_core::SecrecyBytes::from(expected.clone().into_boxed_slice());
+        let mut material = KeyRecord::try_from(&PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32])))?;
+        material.secret = SecretBox::from(expected.clone().into_boxed_slice());
         let key = ProtectedMaterial::new(material)?;
         std::thread::spawn(move || assert_eq!(key.bytes(), expected))
             .join()

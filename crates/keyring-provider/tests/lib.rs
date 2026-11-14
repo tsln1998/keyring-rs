@@ -6,8 +6,9 @@
 
 use anyhow::{Context, Result};
 use bitwarden_crypto::{EncString, Kdf, KeyEncryptable, MasterKey};
-use keyring_core::SecrecyBytes;
-use keyring_provider::{LoadError, config::BitwardenConfig, load};
+use keyring_core::provider::{Error, Provider};
+use keyring_provider::{BitwardenProvider, config::BitwardenConfig};
+use secrecy::SecretBox;
 use serde_json::{Value, json};
 use ssh_key::{LineEnding, PrivateKey, private::Ed25519Keypair};
 use std::{
@@ -28,8 +29,7 @@ const PASSWORD: &str = "fixture-master-password-never-sent";
 ///
 /// Both endpoints share a URL so the captured request order describes the whole load lifecycle.
 struct Fixture {
-    /// Synthetic API credentials and ephemeral loopback addresses passed to the actual loader.
-    config: BitwardenConfig,
+    provider: BitwardenProvider,
     /// Complete HTTP requests, including bodies, retained only for test assertions.
     requests: Arc<Mutex<Vec<String>>>,
     /// Listener task stopped when the fixture leaves scope.
@@ -57,12 +57,12 @@ impl Fixture {
             }
         });
         Ok(Self {
-            config: BitwardenConfig {
+            provider: BitwardenProvider::new(BitwardenConfig {
                 api_url: url.clone(),
                 identity_url: url,
                 client_id: "fixture-client".into(),
                 client_secret: "fixture-secret".to_owned().into(),
-            },
+            })?,
             requests,
             task,
         })
@@ -200,8 +200,27 @@ fn payload() -> Result<(Value, Value, PrivateKey)> {
 }
 
 /// Gives each load its own owned password buffer, matching the public provider boundary.
-fn password(value: &str) -> SecrecyBytes {
-    SecrecyBytes::from(value.as_bytes().to_vec().into_boxed_slice())
+fn password(value: &str) -> SecretBox<[u8]> {
+    SecretBox::from(value.as_bytes().to_vec().into_boxed_slice())
+}
+
+#[test]
+fn construction_rejects_invalid_configuration() {
+    for (url, client_id, client_secret) in [
+        ("file:///tmp/vault", "fixture", "fixture-secret"),
+        ("https://api.example", "", "fixture-secret"),
+        ("https://api.example", "fixture", ""),
+    ] {
+        assert!(
+            BitwardenProvider::new(BitwardenConfig {
+                api_url: url.into(),
+                identity_url: url.into(),
+                client_id: client_id.into(),
+                client_secret: client_secret.to_owned().into(),
+            })
+            .is_err()
+        );
+    }
 }
 
 /// Verifies API-key authentication, local decryption, import filtering, and absence of the master
@@ -210,10 +229,12 @@ fn password(value: &str) -> SecrecyBytes {
 async fn real_auth_sync_decryption_never_sends_master_password() -> Result<()> {
     let (token, sync, key) = payload()?;
     let fixture = Fixture::new(vec![(200, token), (200, sync)]).await?;
-    let materials = load(fixture.config.clone(), password(PASSWORD)).await?;
+    assert!(fixture.requests().is_empty());
+    let provider: &dyn Provider = &fixture.provider;
+    let materials = provider.load(password(PASSWORD)).await?;
     assert_eq!(materials.len(), 1);
-    assert_eq!(materials[0].record.identity, key.public_key().key_data().clone());
-    assert_eq!(materials[0].record.comment, "fixture key");
+    assert_eq!(materials[0].info.identity, key.public_key().key_data().clone());
+    assert_eq!(materials[0].info.comment, "fixture key");
     let requests = fixture.requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with("POST /connect/token"));
@@ -229,7 +250,7 @@ async fn real_auth_sync_decryption_never_sends_master_password() -> Result<()> {
 async fn unauthorized_sync_renews_once_and_retries_once() -> Result<()> {
     let (token, sync, _) = payload()?;
     let fixture = Fixture::new(vec![(200, token.clone()), (401, json!({})), (200, token), (200, sync)]).await?;
-    assert_eq!(load(fixture.config.clone(), password(PASSWORD)).await?.len(), 1);
+    assert_eq!(fixture.provider.load(password(PASSWORD)).await?.len(), 1);
     assert_eq!(fixture.requests().len(), 4);
     Ok(())
 }
@@ -246,8 +267,8 @@ async fn second_unauthorized_response_does_not_trigger_a_third_sync() -> Result<
     ])
     .await?;
     assert!(matches!(
-        load(fixture.config.clone(), password(PASSWORD)).await,
-        Err(LoadError::Sync(_))
+        fixture.provider.load(password(PASSWORD)).await,
+        Err(Error::Sync(_))
     ));
     assert_eq!(fixture.requests().len(), 4);
     Ok(())
@@ -259,14 +280,14 @@ async fn invalid_unlock_inputs_fail_before_sync() -> Result<()> {
     let (token, _, _) = payload()?;
     let fixture = Fixture::new(vec![(200, token.clone())]).await?;
     assert!(matches!(
-        load(fixture.config.clone(), password("wrong password")).await,
-        Err(LoadError::Auth(_))
+        fixture.provider.load(password("wrong password")).await,
+        Err(Error::Auth(_))
     ));
     assert_eq!(fixture.requests().len(), 1);
     let mut unknown_kdf = token.clone();
     unknown_kdf["userDecryptionOptions"]["masterPasswordUnlock"]["kdf"]["kdfType"] = json!(999);
     let fixture = Fixture::new(vec![(200, unknown_kdf)]).await?;
-    let Err(LoadError::Auth(error)) = load(fixture.config.clone(), password(PASSWORD)).await else {
+    let Err(Error::Auth(error)) = fixture.provider.load(password(PASSWORD)).await else {
         anyhow::bail!("expected unsupported KDF authentication error");
     };
     assert!(format!("{error:#}").contains("unsupported bitwarden kdf"));
@@ -278,10 +299,14 @@ async fn invalid_unlock_inputs_fail_before_sync() -> Result<()> {
         .context("invalid fixture token")?
         .remove("userDecryptionOptions");
     let fixture = Fixture::new(vec![(200, token)]).await?;
-    let Err(LoadError::Auth(error)) = load(fixture.config.clone(), password(PASSWORD)).await else {
+    let Err(Error::Auth(error)) = fixture.provider.load(password(PASSWORD)).await else {
         anyhow::bail!("expected missing metadata authentication error");
     };
     assert!(format!("{error:#}").contains("missing master password unlock data"));
+    assert_eq!(
+        error.to_string(),
+        "Bitwarden token response is missing userDecryptionOptions.masterPasswordUnlock"
+    );
     assert_eq!(fixture.requests().len(), 1);
     Ok(())
 }
@@ -292,8 +317,8 @@ async fn non_auth_http_failure_is_not_retried() -> Result<()> {
     let (token, _, _) = payload()?;
     let fixture = Fixture::new(vec![(200, token), (500, json!({}))]).await?;
     assert!(matches!(
-        load(fixture.config.clone(), password(PASSWORD)).await,
-        Err(LoadError::Sync(_))
+        fixture.provider.load(password(PASSWORD)).await,
+        Err(Error::Sync(_))
     ));
     assert_eq!(fixture.requests().len(), 2);
     Ok(())
@@ -311,13 +336,13 @@ async fn each_load_authenticates_and_requires_the_password_again() -> Result<()>
         (200, sync),
     ])
     .await?;
-    assert_eq!(load(fixture.config.clone(), password(PASSWORD)).await?.len(), 1);
+    assert_eq!(fixture.provider.load(password(PASSWORD)).await?.len(), 1);
     assert!(matches!(
-        load(fixture.config.clone(), password("wrong password")).await,
-        Err(LoadError::Auth(_))
+        fixture.provider.load(password("wrong password")).await,
+        Err(Error::Auth(_))
     ));
     assert_eq!(fixture.requests().len(), 3);
-    assert_eq!(load(fixture.config.clone(), password(PASSWORD)).await?.len(), 1);
+    assert_eq!(fixture.provider.load(password(PASSWORD)).await?.len(), 1);
     let requests = fixture.requests();
     assert_eq!(requests.len(), 5);
     for index in [0, 2, 3] {

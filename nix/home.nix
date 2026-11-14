@@ -112,7 +112,6 @@ in
             Service = {
               Type = "simple";
               ExecStart = command;
-              ExecReload = "${pkgs.coreutils}/bin/kill -USR1 $MAINPID";
               Restart = "on-failure";
               RestartSec = 5;
               ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg (dirOf (toString cfg.path))}";

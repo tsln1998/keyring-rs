@@ -17,8 +17,8 @@ use core_foundation::{
     string::{CFString, CFStringRef},
 };
 use keyring_core::{
-    Capabilities, KeySpec, SigningMode, Store, StoreError, StoreHandle, StoreKind, StoreMaterial, StoreRecord,
-    StoredKey, software,
+    crypto,
+    keystore::{Capabilities, Error, KeyId, KeyInfo, KeyRecord, KeySpec, KeyStore, Kind, SigningMode},
 };
 use secrecy::ExposeSecret;
 use security_framework::{
@@ -33,7 +33,11 @@ use security_framework_sys::{
     keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete},
 };
 use ssh_key::{Algorithm, HashAlg};
-use std::{ffi::c_void, ptr};
+use std::{
+    ffi::c_void,
+    ptr,
+    sync::{Mutex, OnceLock},
+};
 use zeroize::Zeroizing;
 
 /// Public records are stored separately so listing does not retrieve private material.
@@ -44,6 +48,10 @@ const SEEDS: &str = "keyring-rs.ed25519";
 const LABEL: &str = "keyring-rs";
 /// Security.framework's missing-item result is benign during bulk cleanup.
 const ITEM_NOT_FOUND: i32 = -25300;
+/// Probe passwords never overlap public records or private key material.
+const PROBE: &str = "keyring-rs.probe";
+/// User-interaction settings are process-wide, so probes must restore them in order.
+static PROBE_LOCK: Mutex<()> = Mutex::new(());
 
 // These Security.framework symbols support attributes and a non-interactive
 // availability probe not exposed by the higher-level wrappers used below.
@@ -55,16 +63,16 @@ unsafe extern "C" {
 
 /// A Keychain backend retaining the result of its initial availability probe.
 pub struct KeychainStore {
-    reason: Option<String>,
+    availability: OnceLock<Result<(), String>>,
 }
 
 /// Adapts platform and serialization failures to the backend error variant.
-fn error(error: impl std::fmt::Display) -> StoreError {
-    StoreError::Backend(error.to_string())
+fn error(error: impl std::fmt::Display) -> Error {
+    Error::Backend(error.to_string())
 }
 
 /// Converts a raw OSStatus, treating only zero as success.
-fn check(status: i32) -> Result<(), StoreError> {
+fn check(status: i32) -> Result<(), Error> {
     if status == 0 {
         Ok(())
     } else {
@@ -80,44 +88,80 @@ unsafe fn attribute(name: CFStringRef) -> CFType {
 }
 
 impl KeychainStore {
-    /// Checks the default keychain's existence and unlocked status without unlocking it.
+    /// Verifies the unlocked default keychain with a temporary write/read/delete round trip.
     pub fn new() -> Self {
-        let reason = match SecKeychain::default() {
-            Err(_) => Some("NO_KEYCHAIN".into()),
-            Ok(keychain) => {
-                let mut status = 0;
-                let result = unsafe { SecKeychainGetStatus(keychain.as_concrete_TypeRef().cast(), &mut status) };
-                if result != 0 {
-                    Some("PROBE_FAILED".into())
-                } else if status & 1 == 0 {
-                    // Bit 0 is kSecUnlockStateStatus; no user prompt is requested here.
-                    Some("LOCKED".into())
-                } else {
-                    None
-                }
-            }
+        let store = Self {
+            availability: OnceLock::new(),
         };
-        Self { reason }
+        let _ = store.available();
+        store
+    }
+
+    /// Checks storage permissions without prompting, retaining the result for this instance.
+    fn probe() -> Result<(), String> {
+        let _lock = PROBE_LOCK.lock().map_err(|_| "PROBE_FAILED".to_owned())?;
+        // The framework guard re-enables interaction on drop; only create it if
+        // interaction was enabled so an already-disabled setting stays disabled.
+        let _interaction = if SecKeychain::user_interaction_allowed().map_err(|_| "PROBE_FAILED".to_owned())? {
+            Some(SecKeychain::disable_user_interaction().map_err(|_| "PROBE_FAILED".to_owned())?)
+        } else {
+            None
+        };
+        let keychain = SecKeychain::default().map_err(|_| "NO_KEYCHAIN".to_owned())?;
+        let mut status = 0;
+        let result = unsafe { SecKeychainGetStatus(keychain.as_concrete_TypeRef().cast(), &mut status) };
+        if result != 0 {
+            return Err("PROBE_FAILED".into());
+        }
+        // Bit 0 is kSecUnlockStateStatus; probing never attempts to unlock the keychain.
+        if status & 1 == 0 {
+            return Err("LOCKED".into());
+        }
+        let nonce = rand::random::<u128>();
+        let account = format!("{nonce:032x}");
+        let payload = nonce.to_be_bytes();
+        let mut query = CFMutableDictionary::<CFType, CFType>::new();
+        unsafe {
+            query.set(attribute(kSecClass), attribute(kSecClassGenericPassword));
+            query.set(attribute(kSecAttrService), CFString::new(PROBE).as_CFType());
+            query.set(attribute(kSecAttrAccount), CFString::new(&account).as_CFType());
+            query.set(attribute(kSecUseKeychain), keychain.as_CFType());
+            query.set(attribute(kSecValueData), CFData::from_buffer(&payload).as_CFType());
+            // SecItemAdd fails on collision instead of overwriting an existing password.
+            check(SecItemAdd(query.as_concrete_TypeRef(), ptr::null_mut())).map_err(|_| "PROBE_FAILED".to_owned())?;
+        }
+        let result = get_generic_password(PROBE, &account)
+            .map_err(|_| "PROBE_FAILED".to_owned())
+            .and_then(|bytes| {
+                if bytes == payload {
+                    Ok(())
+                } else {
+                    Err("PROBE_FAILED".to_owned())
+                }
+            });
+        let cleanup = delete_generic_password(PROBE, &account).map_err(|_| "PROBE_FAILED".to_owned());
+        result.and(cleanup)
     }
 
     /// Rejects operations when the cached startup probe found an unavailable keychain.
-    fn ready(&self) -> Result<(), StoreError> {
-        match &self.reason {
-            Some(reason) => Err(StoreError::Unavailable(reason.clone())),
-            None => Ok(()),
-        }
+    fn ready(&self) -> Result<(), Error> {
+        self.availability
+            .get_or_init(Self::probe)
+            .as_ref()
+            .map(|_| ())
+            .map_err(|reason| Error::Unavailable(reason.clone()))
     }
 
     /// Uses the fingerprint-based handle as the generic-password account name.
-    fn account(handle: &StoreHandle) -> Result<&str, StoreError> {
+    fn account(handle: &KeyId) -> Result<&str, Error> {
         std::str::from_utf8(&handle.0).map_err(error)
     }
 
     /// Loads public metadata separately from an RSA key object or Ed25519 seed.
-    fn record(handle: &StoreHandle) -> Result<StoreRecord, StoreError> {
+    fn record(handle: &KeyId) -> Result<KeyInfo, Error> {
         let bytes = get_generic_password(RECORDS, Self::account(handle)?).map_err(|e| {
             if e.code() == ITEM_NOT_FOUND {
-                StoreError::NotFound
+                Error::NotFound
             } else {
                 error(e)
             }
@@ -126,7 +170,7 @@ impl KeychainStore {
     }
 
     /// Matches an RSA item by both the application label and its per-key tag.
-    fn key_query(handle: &StoreHandle) -> CFMutableDictionary<CFType, CFType> {
+    fn key_query(handle: &KeyId) -> CFMutableDictionary<CFType, CFType> {
         let mut query = CFMutableDictionary::new();
         unsafe {
             query.set(attribute(kSecClass), attribute(kSecClassKey));
@@ -140,7 +184,7 @@ impl KeychainStore {
     }
 
     /// Obtains a retained platform key reference without exporting its private bytes.
-    fn rsa_key(handle: &StoreHandle) -> Result<SecKey, StoreError> {
+    fn rsa_key(handle: &KeyId) -> Result<SecKey, Error> {
         let mut query = Self::key_query(handle);
         let mut raw = ptr::null();
         unsafe {
@@ -148,7 +192,7 @@ impl KeychainStore {
             check(SecItemCopyMatching(query.as_concrete_TypeRef(), &mut raw))?;
         }
         if raw.is_null() {
-            return Err(StoreError::NotFound);
+            return Err(Error::NotFound);
         }
         // SAFETY: A successful CopyMatching with kSecReturnRef transfers an owned
         // key reference, released by SecKey's Core Foundation wrapper.
@@ -159,7 +203,7 @@ impl KeychainStore {
     ///
     /// Non-extractability is an API policy on this imported key, not a claim that
     /// the original software key was generated in protected hardware.
-    fn rsa_import(material: &StoreMaterial, handle: &StoreHandle, bits: u32) -> Result<(), StoreError> {
+    fn rsa_import(material: &KeyRecord, handle: &KeyId, bits: u32) -> Result<(), Error> {
         let mut attributes = CFMutableDictionary::<CFType, CFType>::new();
         unsafe {
             attributes.set(attribute(kSecAttrKeyType), attribute(kSecAttrKeyTypeRSA));
@@ -205,19 +249,20 @@ impl Default for KeychainStore {
     }
 }
 
-impl Store for KeychainStore {
-    fn kind(&self) -> StoreKind {
-        StoreKind::Keychain
+impl KeyStore for KeychainStore {
+    fn kind(&self) -> Kind {
+        Kind::Keychain
     }
-    fn available(&self) -> bool {
-        self.reason.is_none()
-    }
-    fn unavailable_reason(&self) -> Option<String> {
-        self.reason.clone()
+    fn available(&self) -> anyhow::Result<()> {
+        self.availability
+            .get_or_init(Self::probe)
+            .as_ref()
+            .map(|_| ())
+            .map_err(|reason| anyhow::anyhow!("{reason}"))
     }
     fn capabilities(&self, spec: &KeySpec) -> Capabilities {
         Capabilities {
-            supported: self.available(),
+            supported: self.available().is_ok(),
             // Keychain storage alone does not imply platform signing for every key.
             signing: match spec {
                 KeySpec::Rsa { .. } => SigningMode::Platform,
@@ -225,25 +270,26 @@ impl Store for KeychainStore {
             },
         }
     }
-    fn load(&self, material: StoreMaterial) -> Result<StoreHandle, StoreError> {
+    fn load(&self, record: KeyRecord) -> Result<KeyId, Error> {
         self.ready()?;
-        software::validate(&material)?;
-        let handle = StoreHandle(format!("keyring-rs:{}", material.record.fingerprint).into_bytes());
+        crypto::validate(&record)?;
+        let spec: KeySpec = (&record.info.identity).try_into().map_err(|_| Error::Unsupported)?;
+        let handle = KeyId(format!("keyring-rs:{}", record.info.fingerprint).into_bytes());
         if self
             .list()?
             .iter()
-            .any(|key| key.record.identity == material.record.identity)
+            .any(|(_, info)| info.identity == record.info.identity)
         {
-            return Err(StoreError::Duplicate);
+            return Err(Error::Duplicate);
         }
-        let record = serde_json::to_vec(&material.record).map_err(error)?;
+        let payload = serde_json::to_vec(&record.info).map_err(error)?;
         // Import spans two items rather than a transaction. If private material
         // fails to load, attempt to remove the already-written public record too.
-        set_generic_password(RECORDS, Self::account(&handle)?, &record).map_err(error)?;
-        let result = match material.record.spec {
-            KeySpec::Rsa { bits } => Self::rsa_import(&material, &handle, bits),
+        set_generic_password(RECORDS, Self::account(&handle)?, &payload).map_err(error)?;
+        let result = match spec {
+            KeySpec::Rsa { bits } => Self::rsa_import(&record, &handle, bits),
             KeySpec::Ed25519 => {
-                set_generic_password(SEEDS, Self::account(&handle)?, material.secret.expose_secret()).map_err(error)
+                set_generic_password(SEEDS, Self::account(&handle)?, record.secret.expose_secret()).map_err(error)
             }
         };
         if let Err(failure) = result {
@@ -253,7 +299,7 @@ impl Store for KeychainStore {
         }
         Ok(handle)
     }
-    fn list(&self) -> Result<Vec<StoredKey>, StoreError> {
+    fn list(&self) -> Result<Vec<(KeyId, KeyInfo)>, Error> {
         self.ready()?;
         // Search only the public-record service; seeds and RSA key data stay untouched.
         let result = ItemSearchOptions::new()
@@ -273,26 +319,24 @@ impl Store for KeychainStore {
                 let SearchResult::Data(data) = item else {
                     return Err(error("unexpected Keychain record format"));
                 };
-                let record: StoreRecord = serde_json::from_slice(&data).map_err(error)?;
-                Ok(StoredKey {
-                    handle: StoreHandle(format!("keyring-rs:{}", record.fingerprint).into_bytes()),
-                    record,
-                })
+                let record: KeyInfo = serde_json::from_slice(&data).map_err(error)?;
+                Ok((KeyId(format!("keyring-rs:{}", record.fingerprint).into_bytes()), record))
             })
             .collect()
     }
-    fn sign(&self, handle: &StoreHandle, algorithm: Algorithm, data: &[u8]) -> Result<Vec<u8>, StoreError> {
+    fn sign(&self, handle: &KeyId, algorithm: Algorithm, data: &[u8]) -> Result<Vec<u8>, Error> {
         self.ready()?;
         let record = Self::record(handle)?;
-        if !software::supports_algorithm(&record.spec, &algorithm) {
-            return Err(StoreError::Unsupported);
+        let spec: KeySpec = (&record.identity).try_into().map_err(|_| Error::Unsupported)?;
+        if !spec.supports(&algorithm) {
+            return Err(Error::Unsupported);
         }
-        match record.spec {
+        match spec {
             KeySpec::Ed25519 => {
                 // Wipe the returned seed buffer after this attempt. The Keychain
                 // API and signing library may have their own temporary copies.
                 let seed = Zeroizing::new(get_generic_password(SEEDS, Self::account(handle)?).map_err(error)?);
-                software::sign(&seed, algorithm, data)
+                crypto::sign(&seed, algorithm, data)
             }
             KeySpec::Rsa { .. } => {
                 let key = Self::rsa_key(handle)?;
@@ -305,16 +349,17 @@ impl Store for KeychainStore {
                     Algorithm::Rsa {
                         hash: Some(HashAlg::Sha512),
                     } => SecAlgorithm::RSASignatureMessagePKCS1v15SHA512,
-                    _ => return Err(StoreError::Unsupported),
+                    _ => return Err(Error::Unsupported),
                 };
                 key.create_signature(algorithm, data).map_err(error)
             }
         }
     }
-    fn delete(&self, handle: &StoreHandle) -> Result<(), StoreError> {
+    fn delete(&self, handle: &KeyId) -> Result<(), Error> {
         self.ready()?;
         let record = Self::record(handle)?;
-        let status = match record.spec {
+        let spec: KeySpec = (&record.identity).try_into().map_err(|_| Error::Unsupported)?;
+        let status = match spec {
             KeySpec::Rsa { .. } => unsafe { SecItemDelete(Self::key_query(handle).as_concrete_TypeRef()) },
             KeySpec::Ed25519 => delete_generic_password(SEEDS, Self::account(handle)?)
                 .map(|()| 0)
@@ -326,7 +371,7 @@ impl Store for KeychainStore {
         // Remove metadata only after private-item deletion succeeds or finds no item.
         delete_generic_password(RECORDS, Self::account(handle)?).map_err(error)
     }
-    fn clear(&self) -> Result<(), StoreError> {
+    fn clear(&self) -> Result<(), Error> {
         self.ready()?;
         // Bulk queries do not depend on valid records to locate private items.
         // Continue through every category after an individual failure.
@@ -357,17 +402,45 @@ mod tests {
     use ssh_key::{PrivateKey, Signature, private::Ed25519Keypair};
 
     #[test]
+    fn cached_probe_result_controls_availability_and_capabilities() -> anyhow::Result<()> {
+        let store = KeychainStore {
+            availability: OnceLock::from(Ok(())),
+        };
+        store.available()?;
+        for reason in ["NO_KEYCHAIN", "LOCKED", "PROBE_FAILED"] {
+            let store = KeychainStore {
+                availability: OnceLock::from(Err(reason.into())),
+            };
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let store = &store;
+                    scope.spawn(move || {
+                        for _ in 0..3 {
+                            assert_eq!(store.available().expect_err("unavailable store").to_string(), reason);
+                            assert!(matches!(store.ready(), Err(Error::Unavailable(value)) if value == reason));
+                        }
+                    });
+                }
+            });
+            for spec in [KeySpec::Ed25519, KeySpec::Rsa { bits: 2048 }] {
+                assert!(!store.capabilities(&spec).supported);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires a real unlocked macOS Keychain; not verified in CI"]
     fn stored_keys_sign_and_rsa_is_not_extractable() -> Result<(), Box<dyn std::error::Error>> {
         let store = KeychainStore::new();
-        assert!(store.available());
+        store.available()?;
         store.clear()?;
         let rsa = PrivateKey::from(ssh_key::private::RsaKeypair::random(&mut rand::rng(), 2048)?);
         for key in [PrivateKey::from(Ed25519Keypair::from_seed(&[42; 32])), rsa] {
-            let material = software::material(&key)?;
-            let record = material.record.clone();
+            let material = KeyRecord::try_from(&key)?;
+            let record = material.info.clone();
             let handle = store.load(material)?;
-            assert!(store.list()?.iter().any(|stored| stored.record == record));
+            assert!(store.list()?.iter().any(|(_, info)| info == &record));
             let algorithm = if key.algorithm().is_rsa() {
                 Algorithm::Rsa {
                     hash: Some(HashAlg::Sha512),
@@ -383,7 +456,7 @@ mod tests {
             assert!(store.list()?.is_empty());
             assert!(!extractable, "imported RSA key must not be extractable");
         }
-        store.load(software::material(&PrivateKey::from(Ed25519Keypair::from_seed(
+        store.load(KeyRecord::try_from(&PrivateKey::from(Ed25519Keypair::from_seed(
             &[42; 32],
         )))?)?;
         store.clear()?;

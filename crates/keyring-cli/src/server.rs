@@ -1,17 +1,19 @@
-//! Connection serving, configuration replacement, and orderly agent shutdown.
+//! Connection serving and orderly agent shutdown.
 //!
 //! A connection captures one agent generation. State transitions invalidate that generation
-//! so old SSH clients cannot continue using a snapshot after lock or configuration reload.
+//! so old SSH clients cannot continue using a snapshot after lock.
 
 use crate::{
-    config::Config,
-    platform::{Listener, Signal, SignalEvent},
+    platform::{Listener, Signal},
     protocol,
 };
 use anyhow::Result;
-use keyring_core::Store;
-use keyring_protocol::{ServiceAgent, ServiceSession, control, wire::Request};
-use std::{path::Path, sync::Arc, time::Duration};
+use keyring_protocol::{
+    agent::{Agent, Session},
+    codec::Request,
+    control,
+};
+use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, watch},
@@ -20,54 +22,16 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Accepts clients while handling reloads and shutdown for the foreground service.
-///
-/// A valid reload closes the old generation, clears its stores, and installs a locked
-/// agent. Invalid configuration leaves the active agent in place.
-pub async fn serve(
-    listener: &mut Listener,
-    signal: &mut Signal,
-    config: &Path,
-    mut agent: ServiceAgent,
-    stores: Vec<Arc<dyn Store>>,
-) -> Result<()> {
+/// Accepts clients until shutdown, then drains connections and clears the agent's stores.
+pub async fn serve(path: &str, agent: Arc<Agent>) -> Result<()> {
+    let mut listener = Listener::bind(path).await?;
+    let mut signal = Signal::new()?;
     let mut jobs = JoinSet::new();
-    let (mut stop, _) = watch::channel(false);
-    let mut reloads = JoinSet::new();
-    // Coalesce repeated reload signals into at most one extra configuration read.
-    let mut pending = false;
+    let (stop, _) = watch::channel(false);
     loop {
         tokio::select! {
             biased;
-            event = signal.recv() => match event {
-                SignalEvent::Shutdown => break,
-                SignalEvent::Reload => {
-                    if reloads.is_empty() {
-                        let path = config.to_owned();
-                        reloads.spawn_blocking(move || Config::new(path));
-                    } else { pending = true; }
-                }
-            },
-            result = reloads.join_next(), if !reloads.is_empty() => {
-                match result {
-                    Some(Ok(Ok(candidate))) => {
-                        // Stop pending unlocks before waiting for the old agent's cleanup.
-                        stop.send_replace(true);
-                        agent.invalidate();
-                        agent.clear().await?;
-                        agent = ServiceAgent::new(candidate.bitwarden, stores.clone())?;
-                        // New clients must observe a fresh stop channel, not the old true value.
-                        stop = watch::channel(false).0;
-                        tracing::info!("configuration reloaded; agent locked");
-                    }
-                    _ => tracing::error!("configuration reload failed; keeping current agent"),
-                }
-                if pending {
-                    pending = false;
-                    let path = config.to_owned();
-                    reloads.spawn_blocking(move || Config::new(path));
-                }
-            },
+            _ = signal.recv() => break,
             _ = jobs.join_next(), if !jobs.is_empty() => {},
             stream = listener.accept() => {
                 let stream = stream?;
@@ -83,8 +47,6 @@ pub async fn serve(
         }
     }
     stop.send_replace(true);
-    // Aborting the async task set does not stop a blocking config read already in progress.
-    reloads.abort_all();
     // Let connection tasks finish bounded in-flight work before forcing their async cancellation.
     if timeout(Duration::from_secs(30), async {
         while jobs.join_next().await.is_some() {}
@@ -116,7 +78,7 @@ impl Drop for ReaderTask {
 /// blocking KDF or backend work already started may finish before cleanup completes.
 pub async fn handle<Stream>(
     stream: Stream,
-    mut session: ServiceSession,
+    mut session: Session,
     mut generation: watch::Receiver<u64>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()>
@@ -149,16 +111,16 @@ where
             incoming = receiver.recv() => incoming,
         };
         let Some(incoming) = incoming else { break };
-        let unlock = matches!(&incoming, Request::Extension(extension) if extension.name == control::UNLOCK);
-        let control_request = matches!(&incoming, Request::Extension(extension)
-            if matches!(extension.name.as_str(), control::UNLOCK | control::LOCK | control::STATUS));
+        let unlock = matches!(&incoming, Request::Extension { name, .. } if name == control::UNLOCK);
+        let control_request = matches!(&incoming, Request::Extension { name, .. }
+            if matches!(name.as_str(), control::UNLOCK | control::LOCK | control::STATUS));
         // Unlock has a larger budget for its explicit remote load and cryptographic work.
         let budget = if unlock { 180 } else { 30 };
         timeout(Duration::from_secs(budget), async {
             let response = tokio::select! {
                 biased;
                 _ = disconnected.cancelled() => anyhow::bail!("client disconnected"),
-                // Lock changes the generation itself, but must still deliver its control outcome.
+                // Lock changes the generation itself, but must still deliver its control response.
                 _ = generation.changed(), if !control_request => anyhow::bail!("session invalidated"),
                 _ = stop.changed(), if unlock => anyhow::bail!("unlock cancelled by service transition"),
                 response = session.handle(incoming) => response,
@@ -193,8 +155,7 @@ mod tests {
         use super::*;
         use anyhow::Context;
         use bitwarden_crypto::{EncString, Kdf, KeyEncryptable, MasterKey};
-        use keyring_core::Store;
-        use keyring_protocol::wire::SignRequest;
+        use keyring_core::keystore::{KeyStore, Kind};
         use serde_json::json;
         use ssh_key::{LineEnding, PrivateKey, private::Ed25519Keypair};
         use std::num::NonZeroU32;
@@ -209,7 +170,7 @@ mod tests {
         /// Loads an encrypted SSH key, verifies local signing, then locks and closes old sessions.
         #[tokio::test]
         async fn unlock_sign_without_remote_access_and_lock_roundtrip() -> Result<()> {
-            crate::init::init();
+            crate::init();
 
             // Mirror the provider's password-derived user-key wrapping with inexpensive fixture parameters.
             let master = MasterKey::derive(
@@ -283,13 +244,13 @@ mod tests {
                 Ok::<_, anyhow::Error>(requests)
             });
             let memory = Arc::new(keyring_store_memory::MemoryStore::default());
-            let agent = ServiceAgent::new(
-                BitwardenConfig {
+            let agent = Agent::new(
+                Arc::new(BitwardenProvider::new(BitwardenConfig {
                     api_url: url.clone(),
                     identity_url: url,
                     client_id: "fixture-client".into(),
                     client_secret: "fixture-secret".to_owned().into(),
-                },
+                })?),
                 vec![memory.clone()],
             )?;
             let (_stop, stop) = watch::channel(false);
@@ -297,42 +258,46 @@ mod tests {
             let serving = tokio::spawn(handle(server, agent.session(), agent.subscribe(), stop.clone()));
             protocol::write(
                 &mut client,
-                &Request::Extension(Extension {
+                &Request::Extension {
                     name: control::UNLOCK.into(),
                     details: PASSWORD.as_bytes().to_vec().into(),
-                }),
+                },
             )
             .await?;
-            let Response::ExtensionResponse(response) =
+            let Response::Extension(Some((name, details))) =
                 timeout(Duration::from_secs(10), protocol::read_response(&mut client)).await??
             else {
                 anyhow::bail!("unlock response missing");
             };
-            let outcome: control::Outcome = serde_json::from_slice(response.details.as_ref())?;
-            assert!(outcome.ok, "{outcome:?}");
-            assert_eq!(agent.status().state, Phase::Unlocked);
-            assert_eq!(agent.status().keys[0].store, keyring_core::StoreKind::Memory);
+            assert_eq!(name, control::UNLOCK);
+            let response: control::Response = serde_json::from_slice(&details)?;
+            assert!(matches!(response, control::Response::Success), "{response:?}");
+            let control::Response::Status { state, keys, .. } = agent.status() else {
+                anyhow::bail!("status missing");
+            };
+            assert_eq!(state, control::State::Unlocked);
+            assert_eq!(keys[0].store, Kind::Memory);
             assert_eq!(memory.list()?.len(), 1);
             // Repeated identity reads must reuse the completed snapshot rather than reload the vault.
             for _ in 0..2 {
-                protocol::write(&mut client, &Request::RequestIdentities).await?;
-                let Response::IdentitiesAnswer(identities) = protocol::read_response(&mut client).await? else {
+                protocol::write(&mut client, &Request::Identities).await?;
+                let Response::Identities(identities) = protocol::read_response(&mut client).await? else {
                     anyhow::bail!("identities missing");
                 };
                 assert_eq!(identities.len(), 1);
-                assert_eq!(&identities[0].key, key.public_key().key_data());
-                assert_eq!(identities[0].comment, "fixture key");
+                assert_eq!(&identities[0].0, key.public_key().key_data());
+                assert_eq!(identities[0].1, "fixture key");
             }
             protocol::write(
                 &mut client,
-                &Request::SignRequest(SignRequest {
+                &Request::Signature {
                     key: key.public_key().to_bytes()?,
                     data: b"end-to-end signature".to_vec(),
                     flags: 0,
-                }),
+                },
             )
             .await?;
-            let Response::SignResponse(signature) = protocol::read_response(&mut client).await? else {
+            let Response::Signature(signature) = protocol::read_response(&mut client).await? else {
                 anyhow::bail!("signature missing");
             };
             signature::Verifier::verify(key.public_key(), b"end-to-end signature", &signature)?;
@@ -346,17 +311,24 @@ mod tests {
             let locking = tokio::spawn(handle(control_server, agent.session(), agent.subscribe(), stop));
             protocol::write(
                 &mut control_client,
-                &Request::Extension(Extension {
+                &Request::Extension {
                     name: control::LOCK.into(),
                     details: Vec::new().into(),
-                }),
+                },
             )
             .await?;
-            let Response::ExtensionResponse(response) = protocol::read_response(&mut control_client).await? else {
+            let Response::Extension(Some((name, details))) = protocol::read_response(&mut control_client).await? else {
                 anyhow::bail!("lock response missing");
             };
-            assert!(serde_json::from_slice::<control::Outcome>(response.details.as_ref())?.ok);
-            assert_eq!(agent.status().state, Phase::Locked);
+            assert_eq!(name, control::LOCK);
+            assert!(matches!(serde_json::from_slice(&details)?, control::Response::Success));
+            assert!(matches!(
+                agent.status(),
+                control::Response::Status {
+                    state: control::State::Locked,
+                    ..
+                }
+            ));
             assert!(memory.list()?.is_empty());
             // Both the old signing connection and the lock connection finish after the generation changes.
             assert!(
@@ -371,19 +343,19 @@ mod tests {
     }
 
     use super::*;
-    use keyring_protocol::control::Phase;
-    use keyring_protocol::wire::{Extension, Response};
-    use keyring_provider::config::BitwardenConfig;
+    use keyring_protocol::codec::Response;
+    use keyring_provider::{BitwardenProvider, config::BitwardenConfig};
+    use std::sync::Arc;
 
     /// Creates a memory-only agent whose provider requests target a controlled local endpoint.
-    fn agent(url: &str) -> Result<ServiceAgent> {
-        ServiceAgent::new(
-            BitwardenConfig {
+    fn agent(url: &str) -> Result<Arc<Agent>> {
+        Agent::new(
+            Arc::new(BitwardenProvider::new(BitwardenConfig {
                 api_url: url.into(),
                 identity_url: url.into(),
                 client_id: "fixture".into(),
                 client_secret: "fixture".to_owned().into(),
-            },
+            })?),
             vec![Arc::new(keyring_store_memory::MemoryStore::default())],
         )
     }
@@ -395,33 +367,39 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let (_stop, stop) = watch::channel(false);
         let serving = tokio::spawn(handle(server, agent.session(), agent.subscribe(), stop));
-        protocol::write(&mut client, &Request::RequestIdentities).await?;
+        protocol::write(&mut client, &Request::Identities).await?;
         assert!(matches!(protocol::read_response(&mut client).await?, Response::Failure));
         protocol::write(
             &mut client,
-            &Request::Extension(Extension {
+            &Request::Extension {
                 name: "unknown".into(),
                 details: Vec::new().into(),
-            }),
+            },
         )
         .await?;
         assert!(matches!(
             protocol::read_response(&mut client).await?,
-            Response::ExtensionFailure
+            Response::Extension(None)
         ));
         protocol::write(
             &mut client,
-            &Request::Extension(Extension {
+            &Request::Extension {
                 name: control::STATUS.into(),
                 details: Vec::new().into(),
-            }),
+            },
         )
         .await?;
-        let Response::ExtensionResponse(response) = protocol::read_response(&mut client).await? else {
+        let Response::Extension(Some((name, details))) = protocol::read_response(&mut client).await? else {
             anyhow::bail!("missing control response");
         };
-        let status: control::Status = serde_json::from_slice(response.details.as_ref())?;
-        assert_eq!(status.state, Phase::Locked);
+        assert_eq!(name, control::STATUS);
+        assert!(matches!(
+            serde_json::from_slice(&details)?,
+            control::Response::Status {
+                state: control::State::Locked,
+                ..
+            }
+        ));
         drop(client);
         serving.await??;
         Ok(())
@@ -430,7 +408,7 @@ mod tests {
     /// Drops the client after authentication starts and checks the agent returns to locked state.
     #[tokio::test]
     async fn disconnect_during_unlock_rolls_back_to_locked() -> Result<()> {
-        crate::init::init();
+        crate::init();
         let http = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let agent = agent(&format!("http://{}", http.local_addr()?))?;
         let (mut client, server) = tokio::io::duplex(4096);
@@ -438,19 +416,27 @@ mod tests {
         let serving = tokio::spawn(handle(server, agent.session(), agent.subscribe(), stop));
         protocol::write(
             &mut client,
-            &Request::Extension(Extension {
+            &Request::Extension {
                 name: control::UNLOCK.into(),
                 details: b"never-log-fixture-password".to_vec().into(),
-            }),
+            },
         )
         .await?;
         // Accept without replying so the disconnect happens during a pending remote request.
         let (_http_connection, _) = timeout(Duration::from_secs(5), http.accept()).await??;
-        assert_eq!(agent.status().state, Phase::Loading);
+        assert!(matches!(
+            agent.status(),
+            control::Response::Status {
+                state: control::State::Loading,
+                ..
+            }
+        ));
         drop(client);
         assert!(timeout(Duration::from_secs(5), serving).await??.is_err());
-        assert_eq!(agent.status().state, Phase::Locked);
-        assert!(agent.status().keys.is_empty());
+        assert!(matches!(
+            agent.status(),
+            control::Response::Status { state: control::State::Locked, keys, .. } if keys.is_empty()
+        ));
         agent.clear().await?;
         Ok(())
     }

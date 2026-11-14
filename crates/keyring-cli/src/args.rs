@@ -3,16 +3,29 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+const SSH_AUTH_SOCK: &str = "/tmp/keyring.sock";
+
+#[cfg(windows)]
+const SSH_AUTH_SOCK: &str = r"\\.\pipe\openssh-ssh-agent";
+
 /// Selects either service startup or a command sent to an existing local agent.
 #[derive(Debug, Parser)]
 #[command(name = "keyring", arg_required_else_help = true, disable_help_subcommand = true)]
 pub struct Args {
-    /// Configuration read by the service; control commands do not accept this option.
-    #[arg(short, long, value_name = "CONFIG")]
-    pub config: Option<PathBuf>,
     /// Socket or named-pipe override, accepted before or after the subcommand.
-    #[arg(short, long, global = true, value_name = "SOCKET")]
-    pub path: Option<String>,
+    #[arg(
+        short,
+        long,
+        global = true,
+        env = "SSH_AUTH_SOCK",
+        value_name = "SOCKET",
+        default_value = SSH_AUTH_SOCK,
+    )]
+    pub path: String,
+    /// Configuration loaded at service startup; control commands use the running service.
+    #[arg(short, long, value_name = "CONFIG", default_value = "config.toml")]
+    pub config: PathBuf,
     /// Omission starts the foreground service; a subcommand targets an existing service.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -34,29 +47,6 @@ pub enum Command {
     },
 }
 
-impl Args {
-    /// Resolves an explicit endpoint, the client's SSH_AUTH_SOCK, or a service default.
-    ///
-    /// A client must identify an existing agent explicitly or through its environment;
-    /// only a new service falls back to the platform's default endpoint.
-    pub fn socket(&self) -> anyhow::Result<String> {
-        if let Some(path) = &self.path {
-            return Ok(path.clone());
-        }
-        if self.command.is_some() {
-            return std::env::var("SSH_AUTH_SOCK").map_err(|_| anyhow::anyhow!("set SSH_AUTH_SOCK or pass --path"));
-        }
-        #[cfg(unix)]
-        {
-            Ok("/tmp/keyring.sock".into())
-        }
-        #[cfg(windows)]
-        {
-            Ok(r"\\.\pipe\openssh-ssh-agent".into())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Argument placement for control commands.
@@ -71,7 +61,7 @@ mod tests {
             vec!["keyring", "status", "--json", "--path", "test.sock"],
         ] {
             let args = Args::try_parse_from(argv)?;
-            assert_eq!(args.socket()?, "test.sock");
+            assert_eq!(args.path, "test.sock");
             assert!(matches!(args.command, Some(Command::Status { json: true })));
         }
         for argv in [
@@ -79,7 +69,7 @@ mod tests {
             vec!["keyring", "refresh", "--path", "test.sock"],
         ] {
             let args = Args::try_parse_from(argv)?;
-            assert_eq!(args.socket()?, "test.sock");
+            assert_eq!(args.path, "test.sock");
             assert!(matches!(args.command, Some(Command::Refresh)));
         }
         Ok(())

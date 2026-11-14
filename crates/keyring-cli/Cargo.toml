@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
+garde.workspace = true
 keyring-protocol.workspace = true
 keyring-provider.workspace = true
 keyring-core.workspace = true
@@ -23,7 +24,6 @@ rpassword.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_path_to_error.workspace = true
 ssh-encoding.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -39,6 +39,10 @@ toml.default-features = false
 
 # Features
 clap.features = [
+  "derive",
+  "env",
+]
+garde.features = [
   "derive",
 ]
 rustls.features = [
