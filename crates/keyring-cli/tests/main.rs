@@ -154,7 +154,7 @@ fn startup_and_connection_failures_exit_with_one() -> Result<()> {
 }
 
 #[test]
-fn argument_parsing_errors_and_help_are_returned_to_main() -> Result<()> {
+fn argument_parsing_errors_and_help_follow_clap_exit_conventions() -> Result<()> {
     let binary = env!("CARGO_BIN_EXE_keyring");
     for args in [
         vec![],
@@ -164,14 +164,15 @@ fn argument_parsing_errors_and_help_are_returned_to_main() -> Result<()> {
         vec!["status", "--unknown"],
     ] {
         let result = Command::new(binary).args(args).env_remove("SSH_AUTH_SOCK").output()?;
-        assert_eq!(result.status.code(), Some(1));
+        assert_eq!(result.status.code(), Some(2));
         assert!(!result.stderr.is_empty());
+        assert!(result.stdout.is_empty());
     }
     for args in [vec!["--help"], vec!["status", "--help"]] {
         let result = Command::new(binary).args(args).env_remove("SSH_AUTH_SOCK").output()?;
-        assert_eq!(result.status.code(), Some(1));
-        assert!(String::from_utf8(result.stderr)?.contains("Usage:"));
-        assert!(result.stdout.is_empty());
+        assert_eq!(result.status.code(), Some(0));
+        assert!(String::from_utf8(result.stdout)?.contains("Usage:"));
+        assert!(result.stderr.is_empty());
     }
     Ok(())
 }

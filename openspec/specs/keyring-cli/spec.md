@@ -24,8 +24,9 @@ resolving --path before SSH_AUTH_SOCK and falling back to the platform's default
 Unlock SHALL read its password without echo from
 the terminal, without accepting argv or environment passwords. Status SHALL have stable
 text and JSON forms, escape control characters, and distinguish not-running from locked.
-Successful commands SHALL exit with code 0. Argument parsing SHALL propagate errors directly,
-including explicit help requests. All returned errors, including configuration, connection,
+Successful commands SHALL exit with code 0. Clap SHALL handle argument parsing diagnostics:
+invalid arguments SHALL print to stderr and exit with code 2; explicit help requests SHALL
+print to stdout and exit with code 0. All returned errors, including configuration, connection,
 state conflict, and authentication failures, SHALL exit with code 1.
 
 ### Requirement: Status layout
