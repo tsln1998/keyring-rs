@@ -5,9 +5,85 @@ use keyring_core::{
 };
 use keyring_protocol::{
     agent::Agent,
-    codec::{Request, Response},
+    codec::{Codec, Request, Response},
     control::{self, State},
 };
+use tokio::{io::DuplexStream, sync::Notify, task::JoinSet, time::timeout};
+use tokio_util::sync::CancellationToken;
+
+struct Client {
+    codec: Codec<DuplexStream>,
+    shutdown: CancellationToken,
+    tasks: JoinSet<Result<()>>,
+}
+
+impl Client {
+    fn new(agent: &Arc<Agent>) -> Self {
+        let (client, server) = tokio::io::duplex(4096);
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(Arc::clone(agent).serve(server, shutdown.clone()));
+        Self {
+            codec: Codec::new(client),
+            shutdown,
+            tasks,
+        }
+    }
+
+    async fn request(&mut self, request: Request) -> Result<Response> {
+        timeout(Duration::from_secs(10), async {
+            self.codec.write(&request).await?;
+            drop(request);
+            self.codec.read().await
+        })
+        .await?
+    }
+}
+
+struct Release(Arc<AtomicBool>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct PendingProvider {
+    entered: Notify,
+}
+
+impl Provider for PendingProvider {
+    fn load(
+        &self,
+        _password: SecretBox<[u8]>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<KeyRecord>, Error>> + Send + '_>> {
+        Box::pin(async {
+            self.entered.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+async fn control(agent: &Arc<Agent>, request: control::Request) -> Result<control::Response> {
+    let expected = request.name();
+    let Response::Extension(Some((name, details))) = Client::new(agent).request(request.into()).await? else {
+        bail!("missing control response");
+    };
+    ensure!(name == expected, "unexpected control response");
+    Ok(serde_json::from_slice(&details)?)
+}
+
+async fn status(agent: &Arc<Agent>) -> Result<control::Response> {
+    control(agent, control::Request::Status).await
+}
+
+async fn unlock(agent: &Arc<Agent>) -> Result<control::Response> {
+    control(agent, control::Request::Unlock(password())).await
+}
+
+async fn lock(agent: &Arc<Agent>) -> Result<control::Response> {
+    control(agent, control::Request::Lock).await
+}
 use keyring_store_memory::MemoryStore;
 use secrecy::{ExposeSecret, SecretBox};
 use ssh_key::{Algorithm, PrivateKey, private::Ed25519Keypair};
@@ -72,9 +148,10 @@ struct MockStore {
     /// Reject loads once this many keys have already been accepted.
     fail_after: Option<usize>,
     fail_clear: bool,
-    /// Paired flags let a scenario invalidate the agent during backend signing.
+    /// Paired flags let a scenario revoke access during a blocked backend operation.
     entered: Option<Arc<AtomicBool>>,
     release: Option<Arc<AtomicBool>>,
+    block_load: bool,
     memory: MemoryStore,
 }
 
@@ -93,6 +170,7 @@ impl MockStore {
             fail_clear: false,
             entered: None,
             release: None,
+            block_load: false,
             memory: MemoryStore::default(),
         }
     }
@@ -130,6 +208,14 @@ impl KeyStore for MockStore {
             return Err(StoreError::Backend("injected failure".into()));
         }
         let handle = self.memory.load(record)?;
+        if self.block_load
+            && let (Some(entered), Some(release)) = (&self.entered, &self.release)
+        {
+            entered.store(true, Ordering::SeqCst);
+            while !release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
         if self.fail_after_load {
             return Err(StoreError::Backend("injected failure after writing a key".into()));
         }
@@ -145,7 +231,7 @@ impl KeyStore for MockStore {
 
     fn sign(&self, handle: &KeyId, algorithm: Algorithm, data: &[u8]) -> Result<Vec<u8>, StoreError> {
         if let (Some(entered), Some(release)) = (&self.entered, &self.release) {
-            // Let the test revoke the generation while this worker owns the storage lock.
+            // Let the test revoke access while this worker owns the storage lock.
             entered.store(true, Ordering::SeqCst);
             while !release.load(Ordering::SeqCst) {
                 std::thread::yield_now();
@@ -175,39 +261,39 @@ async fn provider_is_loaded_only_on_explicit_unlock() -> Result<()> {
     let memory = Arc::new(MemoryStore::default());
     let agent = Agent::new(provider.clone(), vec![memory.clone()])?;
     assert!(matches!(
-        agent.status(),
+        status(&agent).await?,
         control::Response::Status {
             state: State::Locked,
             ..
         }
     ));
     assert!(matches!(
-        agent.session().handle(Request::Identities).await,
+        Client::new(&agent).request(Request::Identities).await?,
         Response::Failure
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 
     let cloned = Arc::clone(&agent);
-    assert!(matches!(cloned.unlock(password()).await, control::Response::Success));
+    assert!(matches!(unlock(&cloned).await?, control::Response::Success));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    let control::Response::Status { state, keys, .. } = agent.status() else {
+    let control::Response::Status { state, keys, .. } = status(&agent).await? else {
         bail!("status missing");
     };
     assert_eq!(state, State::Unlocked);
     assert_eq!(keys.len(), 1);
-    let mut session = agent.session();
+    let mut client = Client::new(&agent);
     for _ in 0..2 {
-        let Response::Identities(identities) = session.handle(Request::Identities).await else {
+        let Response::Identities(identities) = client.request(Request::Identities).await? else {
             anyhow::bail!("identities missing");
         };
         assert_eq!(identities.len(), 1);
-        let Response::Signature(signature) = session
-            .handle(Request::Signature {
+        let Response::Signature(signature) = client
+            .request(Request::Signature {
                 key: ssh_key::PublicKey::from(identities[0].0.clone()).to_bytes()?,
                 data: b"fixture message".to_vec(),
                 flags: 0,
             })
-            .await
+            .await?
         else {
             anyhow::bail!("signature missing");
         };
@@ -216,26 +302,27 @@ async fn provider_is_loaded_only_on_explicit_unlock() -> Result<()> {
             b"fixture message",
             &signature,
         )?;
-        assert!(matches!(agent.status(), control::Response::Status { keys, .. } if keys.len() == 1));
+        assert!(matches!(status(&agent).await?, control::Response::Status { keys, .. } if keys.len() == 1));
     }
     assert!(matches!(
-        agent.unlock(password()).await,
+        unlock(&agent).await?,
         control::Response::Failure { code, .. } if code == "already-unlocked"
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 
-    assert!(matches!(agent.lock().await, control::Response::Success));
+    assert!(matches!(lock(&agent).await?, control::Response::Success));
     assert!(matches!(
-        cloned.status(),
+        status(&cloned).await?,
         control::Response::Status {
             state: State::Locked,
             ..
         }
     ));
     assert!(memory.list()?.is_empty());
-    assert!(matches!(session.handle(Request::Identities).await, Response::Failure));
+    assert!(client.request(Request::Identities).await.is_err());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
+    assert!(client.request(Request::Identities).await.is_err());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     agent.clear().await?;
     Ok(())
@@ -268,13 +355,13 @@ async fn provider_failures_preserve_codes_and_roll_back_without_exposing_sources
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[17; 32]));
         memory.load(KeyRecord::try_from(&key)?)?;
         let agent = Agent::new(Arc::new(FailingProvider { sync }), vec![memory.clone()])?;
-        let control::Response::Failure { code: actual, message } = agent.unlock(password()).await else {
+        let control::Response::Failure { code: actual, message } = unlock(&agent).await? else {
             bail!("failure missing");
         };
         assert_eq!(actual, code);
         assert_eq!(message, "fixture load failed");
         assert!(matches!(
-            agent.status(),
+            status(&agent).await?,
             control::Response::Status { state: State::Locked, keys, .. } if keys.is_empty()
         ));
         agent.clear().await?;
@@ -293,14 +380,14 @@ async fn startup_is_locked_and_does_not_authenticate() -> Result<()> {
     let agent = Agent::new(provider.clone(), vec![Arc::new(MemoryStore::default())])?;
     let control::Response::Status {
         state, snapshot, keys, ..
-    } = agent.status()
+    } = status(&agent).await?
     else {
         bail!("status missing");
     };
     assert_eq!(state, State::Locked);
     assert!(snapshot.is_none() && keys.is_empty());
     assert!(matches!(
-        agent.session().handle(Request::Identities).await,
+        Client::new(&agent).request(Request::Identities).await?,
         Response::Failure
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -337,7 +424,7 @@ async fn status_reports_availability_and_unavailable_stores_are_skipped() -> Res
     let retained = keychain.list()?;
     let memory = Arc::new(MemoryStore::default());
     let agent = agent(vec![key(1)], vec![keychain.clone(), memory.clone()])?;
-    let control::Response::Status { stores, .. } = agent.status() else {
+    let control::Response::Status { stores, .. } = status(&agent).await? else {
         bail!("status missing");
     };
     assert_eq!(stores.len(), 2);
@@ -347,9 +434,9 @@ async fn status_reports_availability_and_unavailable_stores_are_skipped() -> Res
     assert_eq!(stores[1].kind, Kind::Memory);
     assert!(stores[1].available);
     assert!(stores[1].reason.is_none());
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
     assert!(matches!(
-        agent.status(),
+        status(&agent).await?,
         control::Response::Status { keys, .. } if keys[0].store == Kind::Memory
     ));
     assert_eq!(keychain.list()?, retained);
@@ -374,9 +461,9 @@ async fn priority_capabilities_and_failed_import_fall_back_to_memory() -> Result
             vec![key(1)],
             vec![memory.clone(), Arc::new(desktop), Arc::new(keychain)],
         )?;
-        assert!(matches!(agent.unlock(password()).await, control::Response::Success));
+        assert!(matches!(unlock(&agent).await?, control::Response::Success));
         assert!(matches!(
-            agent.status(),
+            status(&agent).await?,
             control::Response::Status { keys, .. } if keys[0].store == Kind::Memory
         ));
         assert_eq!(memory.list()?.len(), 1);
@@ -398,8 +485,8 @@ async fn imports_choose_highest_priority_and_deduplicate_last_record() -> Result
         vec![first, last],
         vec![memory.clone(), desktop.clone(), keychain.clone()],
     )?;
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
-    let control::Response::Status { keys, .. } = agent.status() else {
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
+    let control::Response::Status { keys, .. } = status(&agent).await? else {
         bail!("status missing");
     };
     assert_eq!(keys.len(), 1);
@@ -425,12 +512,12 @@ async fn reconciliation_deletes_orphans_rotations_and_duplicate_homes() -> Resul
     replacement.set_comment("rotated key");
     let expected = KeyRecord::try_from(&replacement)?.info;
     let agent = agent(vec![replacement], vec![keychain.clone(), memory.clone()])?;
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
     let retained = keychain.list()?;
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].1, expected);
     assert!(memory.list()?.is_empty());
-    let control::Response::Status { keys, .. } = agent.status() else {
+    let control::Response::Status { keys, .. } = status(&agent).await? else {
         bail!("status missing");
     };
     assert_eq!(keys.len(), 1);
@@ -446,12 +533,12 @@ async fn snapshot_cleanup_does_not_require_readable_public_metadata() -> Result<
     keychain.memory.load(KeyRecord::try_from(&key(2))?)?;
     let keychain = Arc::new(keychain);
     let agent = agent(vec![key(1)], vec![keychain.clone(), Arc::new(MemoryStore::default())])?;
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
     let retained = keychain.memory.list()?;
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].1.identity, KeyRecord::try_from(&key(1))?.info.identity);
     assert!(matches!(
-        agent.status(),
+        status(&agent).await?,
         control::Response::Status { keys, .. } if keys[0].store == Kind::Keychain
     ));
     agent.clear().await?;
@@ -467,11 +554,11 @@ async fn failed_import_requires_cleanup_before_fallback() -> Result<()> {
         let keychain = Arc::new(keychain);
         let memory = Arc::new(MemoryStore::default());
         let agent = agent(vec![key(1)], vec![keychain.clone(), memory.clone()])?;
-        let response = agent.unlock(password()).await;
+        let response = unlock(&agent).await?;
         if fail_list {
             assert!(matches!(response, control::Response::Failure { code, .. } if code == "store"));
             assert!(matches!(
-                agent.status(),
+                status(&agent).await?,
                 control::Response::Status { state: State::Locked, keys, .. } if keys.is_empty()
             ));
             assert!(memory.list()?.is_empty());
@@ -480,7 +567,7 @@ async fn failed_import_requires_cleanup_before_fallback() -> Result<()> {
             assert!(keychain.list()?.is_empty());
             assert_eq!(memory.list()?.len(), 1);
             assert!(matches!(
-                agent.status(),
+                status(&agent).await?,
                 control::Response::Status { keys, .. } if keys[0].store == Kind::Memory
             ));
         }
@@ -495,21 +582,23 @@ async fn failed_import_requires_cleanup_before_fallback() -> Result<()> {
 async fn lock_clears_every_store_and_invalidates_sessions() -> Result<()> {
     let memory = Arc::new(MemoryStore::default());
     let agent = agent(vec![key(1)], vec![memory.clone()])?;
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
-    let mut old = agent.session();
-    let generation = agent.subscribe();
-    assert!(matches!(agent.lock().await, control::Response::Success));
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
+    let mut old = Client::new(&agent);
+    assert!(matches!(
+        old.request(Request::Identities).await?,
+        Response::Identities(_)
+    ));
+    assert!(matches!(lock(&agent).await?, control::Response::Success));
     assert!(memory.list()?.is_empty());
     assert!(matches!(
-        agent.status(),
+        status(&agent).await?,
         control::Response::Status {
             state: State::Locked,
             snapshot: None,
             ..
         }
     ));
-    assert!(generation.has_changed()?);
-    assert!(matches!(old.handle(Request::Identities).await, Response::Failure));
+    assert!(old.request(Request::Identities).await.is_err());
     Ok(())
 }
 
@@ -522,14 +611,14 @@ async fn failed_clear_still_locks_and_clears_other_stores() -> Result<()> {
     memory.load(KeyRecord::try_from(&key(2))?)?;
     let agent = agent(vec![key(1)], vec![Arc::new(broken), memory.clone()])?;
     assert!(matches!(
-        agent.unlock(password()).await,
+        unlock(&agent).await?,
         control::Response::Failure { code, .. } if code == "store"
     ));
     assert!(agent.clear().await.is_err());
-    assert!(matches!(agent.lock().await, control::Response::Failure { code, .. } if code == "store"));
+    assert!(matches!(lock(&agent).await?, control::Response::Failure { code, .. } if code == "store"));
     assert!(memory.list()?.is_empty());
     assert!(matches!(
-        agent.status(),
+        status(&agent).await?,
         control::Response::Status {
             state: State::Locked,
             ..
@@ -545,10 +634,10 @@ async fn failed_unlock_rolls_back_without_publishing_keys() -> Result<()> {
         Arc::new(FailingProvider { sync: false }),
         vec![Arc::new(MemoryStore::default())],
     )?;
-    let result = agent.unlock(password()).await;
+    let result = unlock(&agent).await?;
     assert!(matches!(result, control::Response::Failure { code, .. } if code == "auth"));
     assert!(matches!(
-        agent.status(),
+        status(&agent).await?,
         control::Response::Status { state: State::Locked, keys, .. } if keys.is_empty()
     ));
     agent.clear().await?;
@@ -557,35 +646,209 @@ async fn failed_unlock_rolls_back_without_publishing_keys() -> Result<()> {
 
 /// Revocation during backend signing must suppress the result from the old session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lock_rejects_a_signature_computed_with_an_old_generation() -> Result<()> {
+async fn clear_suppresses_a_signature_from_a_revoked_connection() -> Result<()> {
     let entered = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
+    let _release = Release(release.clone());
     let mut keychain = MockStore::new(Kind::Keychain);
     keychain.entered = Some(entered.clone());
     keychain.release = Some(release.clone());
     let agent = agent(vec![key(1)], vec![Arc::new(keychain), Arc::new(MemoryStore::default())])?;
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
-    let mut session = agent.session();
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
+    let mut client = Client::new(&agent);
     let key = key(1).public_key().to_bytes()?;
     let signing = tokio::spawn(async move {
-        session
-            .handle(Request::Signature {
+        client
+            .request(Request::Signature {
                 key,
                 data: b"request".to_vec(),
                 flags: 0,
             })
             .await
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(5), async {
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
     })
     .await?;
-    agent.invalidate();
+    let cleanup = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.clear().await }
+    });
+    let revoked = timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                status(&agent).await?,
+                control::Response::Status {
+                    state: State::Locked,
+                    ..
+                }
+            ) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     release.store(true, Ordering::SeqCst);
-    assert!(matches!(signing.await?, Response::Failure));
+    revoked??;
+    assert!(signing.await?.is_err());
+    cleanup.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_import_finishes_rollback_before_another_unlock() -> Result<()> {
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let _release = Release(release.clone());
+    let mut keychain = MockStore::new(Kind::Keychain);
+    keychain.entered = Some(entered.clone());
+    keychain.release = Some(release.clone());
+    keychain.block_load = true;
+    let keychain = Arc::new(keychain);
+    let memory = Arc::new(MemoryStore::default());
+    let agent = agent(vec![key(1)], vec![keychain.clone(), memory.clone()])?;
+    let mut client = Client::new(&agent);
+    let loading = tokio::spawn(async move { client.request(control::Request::Unlock(password()).into()).await });
+    timeout(Duration::from_secs(5), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    loading.abort();
+    assert!(matches!(loading.await, Err(error) if error.is_cancelled()));
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                status(&agent).await?,
+                control::Response::Status {
+                    state: State::Locked,
+                    ..
+                }
+            ) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    assert!(matches!(unlock(&agent).await?, control::Response::Failure { code, .. } if code == "busy"));
+    release.store(true, Ordering::SeqCst);
+    timeout(Duration::from_secs(5), agent.clear()).await??;
+    assert!(keychain.list()?.is_empty());
+    assert!(memory.list()?.is_empty());
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
     agent.clear().await?;
+    Ok(())
+}
+
+/// Cancellation remains visible even when it happens before the connection starts.
+#[tokio::test]
+async fn shutdown_before_serving_closes_the_connection() -> Result<()> {
+    let agent = agent(vec![], vec![Arc::new(MemoryStore::default())])?;
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let (client, server) = tokio::io::duplex(4096);
+    let mut tasks = JoinSet::new();
+    tasks.spawn(agent.serve(server, shutdown));
+    let mut client = Codec::new(client);
+    assert!(
+        timeout(Duration::from_secs(5), client.read::<Response>())
+            .await?
+            .is_err()
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(5), tasks.join_next()).await?,
+        Some(Ok(Ok(())))
+    ));
+    Ok(())
+}
+
+/// Graceful shutdown allows an in-flight signature to finish before closing its connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_signing_delivers_the_response_before_closing() -> Result<()> {
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let _release = Release(release.clone());
+    let mut keychain = MockStore::new(Kind::Keychain);
+    keychain.entered = Some(entered.clone());
+    keychain.release = Some(release.clone());
+    let agent = agent(vec![key(1)], vec![Arc::new(keychain), Arc::new(MemoryStore::default())])?;
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
+    let mut client = Client::new(&agent);
+    let shutdown = client.shutdown.clone();
+    let public = key(1).public_key().clone();
+    let encoded = public.to_bytes()?;
+    let signing = tokio::spawn(async move {
+        let response = client
+            .request(Request::Signature {
+                key: encoded,
+                data: b"request".to_vec(),
+                flags: 0,
+            })
+            .await?;
+        assert!(
+            timeout(Duration::from_secs(5), client.codec.read::<Response>())
+                .await?
+                .is_err()
+        );
+        Ok::<_, anyhow::Error>(response)
+    });
+    timeout(Duration::from_secs(5), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    shutdown.cancel();
+    release.store(true, Ordering::SeqCst);
+    let Response::Signature(signature) = timeout(Duration::from_secs(5), signing).await??? else {
+        bail!("signature missing");
+    };
+    signature::Verifier::verify(&public, b"request", &signature)?;
+    agent.clear().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_during_unlock_revokes_the_connection_and_rolls_back() -> Result<()> {
+    let provider = Arc::new(PendingProvider { entered: Notify::new() });
+    let agent = Agent::new(provider.clone(), vec![Arc::new(MemoryStore::default())])?;
+    let mut client = Client::new(&agent);
+    let shutdown = client.shutdown.clone();
+    let loading = tokio::spawn(async move { client.request(control::Request::Unlock(password()).into()).await });
+    timeout(Duration::from_secs(5), provider.entered.notified()).await?;
+    assert!(matches!(
+        status(&agent).await?,
+        control::Response::Status {
+            state: State::Loading,
+            ..
+        }
+    ));
+    shutdown.cancel();
+    assert!(timeout(Duration::from_secs(5), loading).await??.is_err());
+    assert!(matches!(status(&agent).await?, control::Response::Status {
+        state: State::Locked, snapshot: None, keys, ..
+    } if keys.is_empty()));
+    agent.clear().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aborting_a_connection_also_drops_its_reader() -> Result<()> {
+    let agent = agent(vec![], vec![Arc::new(MemoryStore::default())])?;
+    let mut client = Client::new(&agent);
+    client.request(control::Request::Status.into()).await?;
+    client.tasks.abort_all();
+    while client.tasks.join_next().await.is_some() {}
+    assert!(
+        timeout(Duration::from_secs(5), client.codec.read::<Response>())
+            .await?
+            .is_err()
+    );
     Ok(())
 }
 
@@ -600,29 +863,29 @@ async fn mixed_algorithms_choose_their_own_stores_and_verify() -> Result<()> {
         vec![rsa, key(8)],
         vec![Arc::new(keychain), Arc::new(desktop), Arc::new(MemoryStore::default())],
     )?;
-    assert!(matches!(agent.unlock(password()).await, control::Response::Success));
-    let control::Response::Status { keys, .. } = agent.status() else {
+    assert!(matches!(unlock(&agent).await?, control::Response::Success));
+    let control::Response::Status { keys, .. } = status(&agent).await? else {
         bail!("status missing");
     };
     assert_eq!(keys[0].store, Kind::Keychain);
     assert_eq!(keys[0].algorithm, "rsa");
     assert_eq!(keys[1].store, Kind::FreeDesktop);
     assert_eq!(keys[1].algorithm, "ed25519");
-    let mut session = agent.session();
-    let Response::Identities(identities) = session.handle(Request::Identities).await else {
+    let mut client = Client::new(&agent);
+    let Response::Identities(identities) = client.request(Request::Identities).await? else {
         bail!("identities missing");
     };
     for (identity, _) in identities {
         let key = ssh_key::PublicKey::from(identity);
         let requested_flags: &[u32] = if key.algorithm().is_rsa() { &[2, 4] } else { &[0] };
         for &flags in requested_flags {
-            let Response::Signature(signature) = session
-                .handle(Request::Signature {
+            let Response::Signature(signature) = client
+                .request(Request::Signature {
                     key: key.to_bytes()?,
                     data: b"mixed stores".to_vec(),
                     flags,
                 })
-                .await
+                .await?
             else {
                 bail!("signature missing");
             };
@@ -642,10 +905,10 @@ async fn partial_import_failure_rolls_back_all_stores() -> Result<()> {
     keychain.fail_after = Some(1);
     let keychain = Arc::new(keychain);
     let agent = agent(vec![key(1), key(2)], vec![keychain.clone(), Arc::new(memory)])?;
-    let response = agent.unlock(password()).await;
+    let response = unlock(&agent).await?;
     assert!(matches!(response, control::Response::Failure { code, .. } if code == "store"));
     assert!(matches!(
-        agent.status(),
+        status(&agent).await?,
         control::Response::Status { state: State::Locked, keys, .. } if keys.is_empty()
     ));
     agent.clear().await?;

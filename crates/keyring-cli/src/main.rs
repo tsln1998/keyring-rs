@@ -4,7 +4,6 @@ mod args;
 mod config;
 mod control;
 mod platform;
-mod protocol;
 mod server;
 
 use anyhow::Result;

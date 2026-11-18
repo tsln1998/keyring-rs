@@ -1,10 +1,15 @@
-//! The supported SSH-agent messages, without transport or private-key operations.
+//! Supported SSH-agent messages and bounded asynchronous framing.
 //!
 //! Extension payloads clear themselves when dispatched, cancelled, or discarded.
 
+use anyhow::{Context, bail};
 use ssh_encoding::{CheckedSum, Decode, Encode, Error, Reader, Writer};
 use ssh_key::{Signature, public::KeyData};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
+
+/// Maximum accepted payload size, excluding the four-byte frame header.
+const MAX_PACKET: usize = 1024 * 1024;
 
 /// Request the public keys currently available from the agent.
 const REQUEST_IDENTITIES: u8 = 11;
@@ -25,6 +30,11 @@ const RESPONSE_SIGNATURE: u8 = 14;
 const RESPONSE_EXTENSION_FAILURE: u8 = 28;
 /// Return an extension name followed by its raw response payload.
 const RESPONSE_EXTENSION_SUCCESS: u8 = 29;
+
+/// Reads and writes bounded frames, zeroizing temporary buffers that may contain passwords.
+pub struct Codec<Stream> {
+    stream: Stream,
+}
 
 /// Supported SSH-agent request bodies, decoded after transport framing.
 pub enum Request {
@@ -78,6 +88,55 @@ pub enum Response {
             Zeroizing<Vec<u8>>,
         )>,
     ),
+}
+
+impl<Stream> Codec<Stream> {
+    /// Wrap an established connection or one of its split halves.
+    pub fn new(stream: Stream) -> Self {
+        Self { stream }
+    }
+
+    /// Read a complete frame, rejecting empty, oversized, truncated, or trailing data.
+    pub async fn read<Packet: Decode>(&mut self) -> anyhow::Result<Packet>
+    where
+        Stream: AsyncRead + Unpin,
+    {
+        let length = self.stream.read_u32().await.context("agent disconnected")? as usize;
+        if length == 0 || length > MAX_PACKET {
+            bail!("invalid SSH agent packet length");
+        }
+        let mut bytes = Zeroizing::new(vec![0; length]);
+        self.stream.read_exact(&mut bytes).await?;
+        let mut input = bytes.as_slice();
+        let packet = Packet::decode(&mut input).map_err(|_| anyhow::anyhow!("invalid SSH agent packet"))?;
+        if !input.is_empty() {
+            bail!("trailing bytes in SSH agent packet");
+        }
+        Ok(packet)
+    }
+
+    /// Encode and flush a bounded frame without retaining the temporary secret buffer.
+    pub async fn write<Packet: Encode>(&mut self, packet: &Packet) -> anyhow::Result<()>
+    where
+        Stream: AsyncWrite + Unpin,
+    {
+        let length = packet
+            .encoded_len()
+            .map_err(|_| anyhow::anyhow!("cannot encode agent packet"))?;
+        if length > MAX_PACKET {
+            bail!("SSH agent packet too large");
+        }
+        let mut bytes = Zeroizing::new(Vec::with_capacity(length + 4));
+        (length as u32)
+            .encode(&mut *bytes)
+            .map_err(|_| anyhow::anyhow!("cannot encode packet length"))?;
+        packet
+            .encode(&mut *bytes)
+            .map_err(|_| anyhow::anyhow!("cannot encode agent packet"))?;
+        self.stream.write_all(&bytes).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
 }
 
 /// Decode request bodies and discard the remaining bytes of unsupported messages.

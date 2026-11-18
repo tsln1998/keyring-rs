@@ -3,11 +3,10 @@
 //! Control extensions share the SSH-agent endpoint. Password bytes travel over the local
 //! socket or named pipe without transport encryption; access depends on OS endpoint permissions.
 
-use crate::protocol;
 use anyhow::{Context, Result, bail, ensure};
 use comfy_table::{Table, presets::NOTHING};
 use keyring_core::keystore::SigningMode;
-use keyring_protocol::codec::{Request, Response};
+use keyring_protocol::codec::{Codec, Request, Response};
 use keyring_protocol::control;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -39,7 +38,7 @@ async fn connect(path: &str) -> std::io::Result<tokio::net::windows::named_pipe:
 
 /// Executes one control exchange, returning transport and service failures to the caller.
 pub async fn run(path: &str, action: Action) -> Result<()> {
-    let mut stream = match timeout(Duration::from_secs(10), connect(path)).await {
+    let stream = match timeout(Duration::from_secs(10), connect(path)).await {
         Ok(Ok(stream)) => stream,
         _ => {
             if let Action::Status { json } = action {
@@ -55,6 +54,7 @@ pub async fn run(path: &str, action: Action) -> Result<()> {
             bail!("cannot connect to agent at {path}");
         }
     };
+    let mut stream = Codec::new(stream);
     let request = match action {
         Action::Unlock => {
             // Terminal input can block, so keep it off the async worker threads.
@@ -73,11 +73,10 @@ pub async fn run(path: &str, action: Action) -> Result<()> {
     let budget = if name == control::UNLOCK { 180 } else { 10 };
     let bytes = timeout(Duration::from_secs(budget), async {
         let request = Request::from(request);
-        protocol::write(&mut stream, &request).await?;
+        stream.write(&request).await?;
         // Release the owned payload before waiting for the service's response.
         drop(request);
-        let Response::Extension(Some((response_name, response_details))) = protocol::read_response(&mut stream).await?
-        else {
+        let Response::Extension(Some((response_name, response_details))) = stream.read().await? else {
             bail!("agent rejected control extension");
         };
         ensure!(response_name == name, "unexpected agent extension response");
@@ -271,20 +270,19 @@ mod tests {
             let path = directory.path().join("agent.sock");
             let listener = tokio::net::UnixListener::bind(&path)?;
             let fixture = async move {
-                let (mut stream, _) = listener.accept().await?;
+                let (stream, _) = listener.accept().await?;
+                let mut stream = Codec::new(stream);
                 drop(listener);
-                let Request::Extension { name, .. } = protocol::read_request(&mut stream).await? else {
+                let Request::Extension { name, .. } = stream.read().await? else {
                     bail!("expected a control request");
                 };
                 assert_eq!(name, control::LOCK);
-                protocol::write(
-                    &mut stream,
-                    &Response::Extension(Some((
+                stream
+                    .write(&Response::Extension(Some((
                         name,
                         serde_json::to_vec(&control::Response::failure(code, "fixture lock failure"))?.into(),
-                    ))),
-                )
-                .await
+                    ))))
+                    .await
             };
             let path = path.to_str().context("invalid fixture socket path")?;
             let (served, result) = timeout(Duration::from_secs(5), async {

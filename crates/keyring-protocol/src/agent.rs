@@ -5,18 +5,18 @@
 //! retaining a provider session or scheduling refreshes. Signing uses those handles.
 //!
 //! State transitions and blocking store access have separate locks. Invalidating
-//! a generation immediately revokes sessions, while store cleanup may finish later
+//! a token immediately revokes sessions, while store cleanup may finish later
 //! and can fail. Already running blocking work cannot be stopped by dropping its
 //! async caller.
 
 use crate::{
-    codec::{Request, Response},
+    codec::{Codec, Request, Response},
     control,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use keyring_core::{
-    keystore::{KeyId, KeyInfo, KeyRecord, KeySpec, KeyStore, Kind},
+    keystore::{KeyId, KeyRecord, KeySpec, KeyStore, Kind},
     provider::{self, Provider},
 };
 use secrecy::{ExposeSecret, SecretBox};
@@ -26,8 +26,15 @@ use ssh_key::{Algorithm, HashAlg, Signature, public::KeyData};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
-use tokio::sync::{OwnedMutexGuard, watch};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::{OwnedMutexGuard, mpsc},
+    task::{JoinHandle, JoinSet},
+    time::timeout,
+};
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 /// Select RSA signatures using SHA-256 through the SSH-agent signing flags.
@@ -48,29 +55,14 @@ pub struct Agent {
     operations: Arc<tokio::sync::Mutex<()>>,
     /// Serializes blocking import, signing, and cleanup without blocking async tasks.
     storage: Mutex<()>,
-    /// Notifies the transport when invalidation makes existing sessions obsolete.
-    generation: watch::Sender<u64>,
-}
-
-/// Per-connection authorization generation and accepted OpenSSH session bindings.
-///
-/// A session remains tied to the generation in which it was created. Locking
-/// invalidates it permanently, even if the shared service is unlocked again.
-pub struct Session {
-    /// Shared agent used to dispatch storage and control operations.
-    agent: Arc<Agent>,
-    /// Agent epoch captured at session creation; a mismatch revokes this session.
-    generation: u64,
-    /// Session IDs and forwarding flags; these do not impose per-key restrictions.
-    binds: Vec<(Vec<u8>, bool)>,
 }
 
 /// The visible snapshot; no private key bytes or provider decryption keys live here.
 struct State {
     /// Current lock state, including whether an explicit unlock is loading keys.
     state: control::State,
-    /// Revocation epoch checked by sessions and background work before publishing results.
-    generation: u64,
+    /// Shared by current connections and workers; replaced when access is revoked.
+    revoked: CancellationToken,
     /// Published identities and their backend routes, ordered by public key.
     keys: BTreeMap<KeyData, Binding>,
     /// Timestamp metadata for the last successfully published unlock snapshot.
@@ -83,8 +75,8 @@ struct Binding {
     store: Arc<dyn KeyStore>,
     /// Opaque handle issued by that backend for its stored key.
     handle: KeyId,
-    /// Public key, comment, and fingerprint cached without private bytes.
-    info: KeyInfo,
+    /// Public status metadata captured when the backend accepts the key.
+    key: control::Key,
 }
 
 /// Restores locked state if unlock exits before publishing a complete snapshot.
@@ -122,14 +114,100 @@ impl Agent {
             stores,
             state: Mutex::new(State {
                 state: control::State::Locked,
-                generation: 0,
+                revoked: CancellationToken::new(),
                 keys: BTreeMap::new(),
                 snapshot: None,
             }),
             operations: Arc::new(tokio::sync::Mutex::new(())),
             storage: Mutex::new(()),
-            generation: watch::channel(0).0,
         }))
+    }
+
+    /// Serve one connection with bounded requests and disconnect-aware unlock rollback.
+    ///
+    /// Each connection retains its own revocation token and OpenSSH binding chain.
+    /// Dropping the handler aborts its reader; blocking backend work may finish later.
+    pub async fn serve<Stream>(self: Arc<Self>, stream: Stream, shutdown: CancellationToken) -> Result<()>
+    where
+        Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let revoked = self.state().revoked.clone();
+        let mut binds = Vec::new();
+        let (reader, writer) = tokio::io::split(stream);
+        let mut writer = Codec::new(writer);
+        let disconnected = CancellationToken::new();
+        let reader_cancelled = disconnected.clone();
+        // Bound read-ahead, including password-bearing extension payloads awaiting dispatch.
+        let (sender, mut receiver) = mpsc::channel(16);
+        let mut readers = JoinSet::new();
+        readers.spawn(async move {
+            // Any reader exit, including task abort, notifies an in-flight request of disconnect.
+            let _guard = reader_cancelled.drop_guard();
+            let mut reader = Codec::new(reader);
+            while let Ok(request) = reader.read::<Request>().await {
+                if sender.send(request).await.is_err() {
+                    break;
+                }
+            }
+        });
+        loop {
+            let incoming = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = revoked.cancelled() => break,
+                _ = disconnected.cancelled() => break,
+                incoming = receiver.recv() => incoming,
+            };
+            let Some(incoming) = incoming else { break };
+            let unlock = matches!(&incoming, Request::Extension { name, .. } if name == control::UNLOCK);
+            let control_request = matches!(&incoming, Request::Extension { name, .. }
+                if matches!(name.as_str(), control::UNLOCK | control::LOCK | control::STATUS));
+            // Unlock has a larger budget for its explicit remote load and cryptographic work.
+            let budget = if unlock { 180 } else { 30 };
+            timeout(Duration::from_secs(budget), async {
+                let response = tokio::select! {
+                    biased;
+                    _ = disconnected.cancelled() => bail!("client disconnected"),
+                    // Lock revokes its own connection, but must still deliver its control response.
+                    _ = revoked.cancelled(), if !control_request => bail!("session invalidated"),
+                    _ = shutdown.cancelled(), if unlock => bail!("unlock cancelled by service transition"),
+                    response = async {
+                        match incoming {
+                            Request::Identities => self.identities(&revoked)
+                                .map(Response::Identities).unwrap_or(Response::Failure),
+                            Request::Signature { key, data, flags } => self.sign(&revoked, key, data, flags)
+                                .await.map(Response::Signature).unwrap_or(Response::Failure),
+                            Request::Extension { name, details } => self.extension(name, details, &mut binds)
+                                .await.unwrap_or(Response::Extension(None)),
+                            Request::Unsupported => Response::Failure,
+                        }
+                    } => response,
+                };
+                tokio::select! {
+                    biased;
+                    // Suppress stale ordinary responses if a transition occurred during the request.
+                    _ = revoked.cancelled(), if !control_request => bail!("session invalidated before response"),
+                    _ = disconnected.cancelled() => bail!("client disconnected"),
+                    result = writer.write(&response) => result,
+                }
+            })
+            .await??;
+            // A successful control response can be the final message of a revoked connection.
+            if revoked.is_cancelled() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Revoke sessions and wait for transition ownership before clearing stores.
+    ///
+    /// Used when cleanup must wait for outstanding work, such as shutdown.
+    /// Unavailable stores are skipped; errors propagate.
+    pub async fn clear(self: &Arc<Self>) -> Result<()> {
+        self.invalidate();
+        let operation = Arc::clone(&self.operations).lock_owned().await;
+        self.cleanup(operation).await?
     }
 
     /// Recover the state guard even after poisoning so invalidation remains possible.
@@ -137,46 +215,12 @@ impl Agent {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Capture the current generation for a newly accepted connection.
-    pub fn session(self: &Arc<Self>) -> Session {
-        Session {
-            agent: Arc::clone(self),
-            generation: self.state().generation,
-            binds: Vec::new(),
-        }
-    }
-
-    /// Watch generation changes so the transport can close invalidated connections.
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.generation.subscribe()
-    }
-
     /// Return public key metadata and the actual stores in their current order.
     ///
     /// Reading status never contacts the provider or refreshes the snapshot.
-    pub fn status(&self) -> control::Response {
+    fn status(&self) -> control::Response {
         let current = self.state();
-        let mut keys: Vec<_> = current
-            .keys
-            .values()
-            .map(|binding| {
-                let spec =
-                    KeySpec::try_from(&binding.info.identity).expect("imported key has a supported specification");
-                let capabilities = binding.store.capabilities(&spec);
-                let (algorithm, bits) = match spec {
-                    KeySpec::Ed25519 => ("ed25519", None),
-                    KeySpec::Rsa { bits } => ("rsa", Some(bits)),
-                };
-                control::Key {
-                    fingerprint: binding.info.fingerprint.clone(),
-                    comment: binding.info.comment.clone(),
-                    algorithm: algorithm.into(),
-                    bits,
-                    store: binding.store.kind(),
-                    signing: capabilities.signing,
-                }
-            })
-            .collect();
+        let mut keys: Vec<_> = current.keys.values().map(|binding| binding.key.clone()).collect();
         keys.sort_by(|left, right| {
             (left.store, &left.comment, &left.fingerprint).cmp(&(right.store, &right.comment, &right.fingerprint))
         });
@@ -205,21 +249,21 @@ impl Agent {
     /// Load, decrypt, and import one remote snapshot using the supplied password.
     ///
     /// Only a complete import is published. Failure or cancellation invalidates
-    /// the generation and schedules rollback; rollback store errors are logged.
+    /// sessions and schedules rollback; rollback store errors are logged.
     /// Temporary secret buffers are dropped with their owners, but cancellation
     /// cannot immediately stop blocking work or erase copies held by dependencies.
-    pub async fn unlock(self: &Arc<Self>, password: SecretBox<[u8]>) -> control::Response {
+    async fn unlock(self: &Arc<Self>, password: SecretBox<[u8]>) -> control::Response {
         let operation = match Arc::clone(&self.operations).try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => return control::Response::failure("busy", "another state transition is in progress"),
         };
-        let generation = {
+        let revoked = {
             let mut current = self.state();
             if current.state != control::State::Locked {
                 return control::Response::failure("already-unlocked", "agent is already unlocked");
             }
             current.state = control::State::Loading;
-            current.generation
+            current.revoked.clone()
         };
         // Keep rollback armed across every await, including cancellation when
         // the transport drops this future before an outcome can be returned.
@@ -241,7 +285,8 @@ impl Agent {
         let agent = Arc::clone(self);
         // Backend APIs are synchronous. A detached worker may finish after this
         // future is cancelled; the storage lock orders rollback after that work.
-        let imported = tokio::task::spawn_blocking(move || agent.import(records, generation))
+        let import_revoked = revoked.clone();
+        let imported = tokio::task::spawn_blocking(move || agent.import(records, &import_revoked))
             .await
             .context("SSH key import worker failed")
             .and_then(|result| result);
@@ -256,7 +301,7 @@ impl Agent {
             let mut current = self.state();
             // Invalidation can race with blocking import, so recheck before
             // exposing any of its bindings to SSH clients.
-            if current.generation != generation {
+            if revoked.is_cancelled() {
                 return control::Response::failure("cancelled", "unlock was cancelled");
             }
             current.keys = bindings;
@@ -272,69 +317,59 @@ impl Agent {
     ///
     /// A cleanup failure leaves the agent locked but can leave backend data behind.
     /// Competing transitions return `busy` rather than waiting.
-    pub async fn lock(self: &Arc<Self>) -> control::Response {
+    async fn lock(self: &Arc<Self>) -> control::Response {
         let operation = match Arc::clone(&self.operations).try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => return control::Response::failure("busy", "another state transition is in progress"),
         };
         // Revocation precedes potentially slow or failing backend cleanup.
         self.invalidate();
-        let agent = Arc::clone(self);
-        match tokio::task::spawn_blocking(move || {
-            // Let the blocking worker retain transition ownership if its async
-            // caller disappears while cleanup is still running.
-            let _operation = operation;
-            agent.clear_stores()
-        })
-        .await
-        {
+        match self.cleanup(operation).await {
             Ok(Ok(())) => control::Response::Success,
             _ => control::Response::failure("store", "agent locked, but a platform store could not be cleared"),
         }
     }
 
-    /// Clear published metadata and advance the session generation synchronously.
+    /// Clear published metadata and cancel current sessions and workers synchronously.
     ///
     /// This revokes access but does not remove data from any backend. Call `lock`
     /// or `clear` when store cleanup is also required.
-    pub fn invalidate(&self) {
+    fn invalidate(&self) {
         let mut current = self.state();
         current.state = control::State::Locked;
         current.keys.clear();
         current.snapshot = None;
-        current.generation = current.generation.wrapping_add(1);
-        self.generation.send_replace(current.generation);
+        current.revoked.cancel();
+        current.revoked = CancellationToken::new();
     }
 
-    /// Revoke sessions and wait for transition ownership before clearing stores.
-    ///
-    /// Used when cleanup must wait for outstanding work, such as shutdown.
-    /// Unavailable stores are skipped; errors propagate.
-    pub async fn clear(self: &Arc<Self>) -> Result<()> {
-        self.invalidate();
-        let operation = Arc::clone(&self.operations).lock_owned().await;
+    /// Keep transition ownership until blocking cleanup finishes, even if its caller is dropped.
+    fn cleanup(self: &Arc<Self>, operation: OwnedMutexGuard<()>) -> JoinHandle<Result<()>> {
         let agent = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _operation = operation;
-            agent.clear_stores()
+            let result = agent
+                .storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))
+                .and_then(|_storage| agent.clear_stores());
+            if let Err(error) = &result {
+                tracing::error!(%error, "failed to clear stores");
+            }
+            result
         })
-        .await?
     }
 
     /// Attempt every available store even if an earlier store fails to clear.
     ///
-    /// The storage lock prevents cleanup from racing with an import or backend sign.
+    /// The caller holds the storage lock to order cleanup with import and signing.
     /// Success says nothing about stores skipped because they are unavailable.
     fn clear_stores(&self) -> Result<()> {
-        let _storage = self
-            .storage
-            .lock()
-            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
         let mut failed = false;
         for store in self.stores.iter().filter(|store| store.available().is_ok()) {
-            if store.clear().is_err() {
+            if let Err(error) = store.clear() {
                 failed = true;
-                tracing::error!(store = ?store.kind(), "failed to clear store");
+                tracing::error!(store = ?store.kind(), %error, "failed to clear store");
             }
         }
         if failed {
@@ -348,7 +383,7 @@ impl Agent {
     /// The caller publishes the resulting bindings or rolls back all stores on error.
     /// Cancellation during blocking work is handled by that rollback after this
     /// function releases the storage lock.
-    fn import(&self, records: Vec<KeyRecord>, generation: u64) -> Result<BTreeMap<KeyData, Binding>> {
+    fn import(&self, records: Vec<KeyRecord>, revoked: &CancellationToken) -> Result<BTreeMap<KeyData, Binding>> {
         let _storage = self
             .storage
             .lock()
@@ -357,7 +392,7 @@ impl Agent {
         // worker was queued behind cleanup or a signature.
         {
             let current = self.state();
-            if current.generation != generation || current.state != control::State::Loading {
+            if revoked.is_cancelled() || current.state != control::State::Loading {
                 bail!("key import was cancelled");
             }
         }
@@ -369,17 +404,14 @@ impl Agent {
         }
         // Reconcile from a complete snapshot by removing old keys from every usable
         // backend, including duplicate homes and keys removed from the remote vault.
-        for store in self.stores.iter().filter(|store| store.available().is_ok()) {
-            store
-                .clear()
-                .with_context(|| format!("{:?}: clear existing keys", store.kind()))?;
-        }
+        self.clear_stores()?;
         let mut bindings = BTreeMap::new();
         for (identity, record) in unique {
             let spec: KeySpec = (&identity).try_into()?;
             let mut home = None;
             for store in self.stores.iter().filter(|store| store.available().is_ok()) {
-                if !store.capabilities(&spec).supported {
+                let capabilities = store.capabilities(&spec);
+                if !capabilities.supported {
                     continue;
                 }
                 // Each backend consumes its input, so preserve the original secret
@@ -390,7 +422,7 @@ impl Agent {
                 };
                 match store.load(copy) {
                     Ok(handle) => {
-                        home = Some((Arc::clone(store), handle));
+                        home = Some((Arc::clone(store), handle, capabilities.signing));
                         break;
                     }
                     Err(error) => {
@@ -412,61 +444,53 @@ impl Agent {
             }
             // A failure after earlier successes is left for the caller's rollback;
             // this function never publishes a partial set of keys.
-            let (store, handle) = home.context("all stores rejected a key")?;
-            bindings.insert(
-                identity,
-                Binding {
-                    store,
-                    handle,
-                    info: record.info,
-                },
-            );
+            let (store, handle, signing) = home.context("all stores rejected a key")?;
+            let (algorithm, bits) = match spec {
+                KeySpec::Ed25519 => ("ed25519", None),
+                KeySpec::Rsa { bits } => ("rsa", Some(bits)),
+            };
+            let key = control::Key {
+                fingerprint: record.info.fingerprint,
+                comment: record.info.comment,
+                algorithm: algorithm.into(),
+                bits,
+                store: store.kind(),
+                signing,
+            };
+            bindings.insert(identity, Binding { store, handle, key });
         }
         Ok(bindings)
     }
-}
-
-impl Session {
-    /// Dispatch supported requests, rejecting all key-management operations.
-    pub async fn handle(&mut self, request: Request) -> Response {
-        match request {
-            Request::Identities => self.identities().map(Response::Identities).unwrap_or(Response::Failure),
-            Request::Signature { key, data, flags } => self
-                .sign(key, data, flags)
-                .await
-                .map(Response::Signature)
-                .unwrap_or(Response::Failure),
-            Request::Extension { name, details } => {
-                self.extension(name, details).await.unwrap_or(Response::Extension(None))
-            }
-            Request::Unsupported => Response::Failure,
-        }
-    }
-
     /// Enumerate the published identities in the map's public-key order.
-    fn identities(&self) -> Result<Vec<(KeyData, String)>> {
-        let current = self.agent.state();
-        current.check(self.generation)?;
+    fn identities(&self, revoked: &CancellationToken) -> Result<Vec<(KeyData, String)>> {
+        let current = self.state();
+        current.check(revoked)?;
         Ok(current
             .keys
             .iter()
-            .map(|(identity, binding)| (identity.clone(), binding.info.comment.clone()))
+            .map(|(identity, binding)| (identity.clone(), binding.key.comment.clone()))
             .collect())
     }
 
     /// Dispatch signing to the selected backend without contacting the provider.
-    async fn sign(&self, key: Vec<u8>, data: Vec<u8>, flags: u32) -> Result<Signature> {
+    async fn sign(
+        self: &Arc<Self>,
+        revoked: &CancellationToken,
+        key: Vec<u8>,
+        data: Vec<u8>,
+        flags: u32,
+    ) -> Result<Signature> {
         let identity = ssh_key::PublicKey::from_bytes(&key)?;
         let (store, handle) = {
-            let current = self.agent.state();
-            current.check(self.generation)?;
+            let current = self.state();
+            current.check(revoked)?;
             let binding = current.keys.get(identity.key_data()).context("unknown SSH key")?;
             (Arc::clone(&binding.store), binding.handle.clone())
         };
         let spec = identity.key_data().try_into()?;
         let algorithm = Self::algorithm(&spec, flags)?;
-        let agent = Arc::clone(&self.agent);
-        let generation = self.generation;
+        let agent = Arc::clone(self);
+        let revoked = revoked.clone();
         // Clone only routing metadata; private material remains owned by stores.
         tokio::task::spawn_blocking(move || {
             let _storage = agent
@@ -474,25 +498,30 @@ impl Session {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("store access lock poisoned"))?;
             // Authorization can change while this worker waits for store access.
-            agent.state().check(generation)?;
+            agent.state().check(&revoked)?;
             let bytes = store.sign(&handle, algorithm.clone(), &data)?;
             // Invalidation cannot interrupt a backend already signing. Discard
-            // its result if the generation changed during that operation.
+            // its result if the connection was revoked during that operation.
             let current = agent.state();
-            current.check(generation)?;
+            current.check(&revoked)?;
             Ok(Signature::new(algorithm, bytes)?)
         })
         .await?
     }
 
     /// Handle explicit controls and the supported standard SSH-agent extensions.
-    async fn extension(&mut self, name: String, details: Zeroizing<Vec<u8>>) -> Result<Response> {
+    async fn extension(
+        self: &Arc<Self>,
+        name: String,
+        details: Zeroizing<Vec<u8>>,
+        binds: &mut Vec<(Vec<u8>, bool)>,
+    ) -> Result<Response> {
         let response = match name.as_str() {
             control::UNLOCK | control::LOCK | control::STATUS => {
                 let response = match control::Request::decode(&name, details) {
-                    Ok(control::Request::Unlock(password)) => self.agent.unlock(password).await,
-                    Ok(control::Request::Lock) => self.agent.lock().await,
-                    Ok(control::Request::Status) => self.agent.status(),
+                    Ok(control::Request::Unlock(password)) => self.unlock(password).await,
+                    Ok(control::Request::Lock) => self.lock().await,
+                    Ok(control::Request::Status) => self.status(),
                     Err(error) => control::Response::failure("usage", error.to_string()),
                 };
                 serde_json::to_vec(&response)?
@@ -503,7 +532,7 @@ impl Session {
                 ["query", BIND].as_slice().encode_vec()?
             }
             BIND => {
-                self.bind(&details)?;
+                Self::bind(binds, &details)?;
                 return Ok(Response::Success);
             }
             _ => bail!("unsupported extension"),
@@ -512,7 +541,7 @@ impl Session {
     }
 
     /// Decode and verify an OpenSSH session binding, rejecting trailing data.
-    fn bind(&mut self, details: &[u8]) -> Result<()> {
+    fn bind(binds: &mut Vec<(Vec<u8>, bool)>, details: &[u8]) -> Result<()> {
         let mut reader = details;
         let host_key = reader.read_prefixed(|reader| {
             let key = KeyData::decode(reader)?;
@@ -530,15 +559,10 @@ impl Session {
         host_key.verify(&session_id, &signature)?;
         // Bound the forwarding chain, reject replayed session IDs, and
         // forbid extending a chain after its non-forwarding endpoint.
-        if self.binds.len() >= 64
-            || self
-                .binds
-                .iter()
-                .any(|(id, forwarding)| *id == session_id || !forwarding)
-        {
+        if binds.len() >= 64 || binds.iter().any(|(id, forwarding)| *id == session_id || !forwarding) {
             bail!("invalid session binding chain");
         }
-        self.binds.push((session_id, forwarding));
+        binds.push((session_id, forwarding));
         Ok(())
     }
 
@@ -564,9 +588,9 @@ impl Session {
 }
 
 impl State {
-    /// Require an unlocked snapshot from the connection's original generation.
-    fn check(&self, generation: u64) -> Result<()> {
-        if self.state != control::State::Unlocked || self.generation != generation {
+    /// Require an unlocked snapshot and a connection that has not been revoked.
+    fn check(&self, revoked: &CancellationToken) -> Result<()> {
+        if self.state != control::State::Unlocked || revoked.is_cancelled() {
             bail!("agent locked or session invalidated");
         }
         Ok(())
@@ -594,21 +618,15 @@ impl Drop for Rollback {
             return;
         };
         self.agent.invalidate();
-        let agent = Arc::clone(&self.agent);
         // Cleanup waits behind any import or signature already holding storage.
         // Drop cannot await it or return an error, so failures are logged instead.
-        tokio::task::spawn_blocking(move || {
-            let _operation = operation;
-            if agent.clear_stores().is_err() {
-                tracing::error!("failed to clear stores during rollback");
-            }
-        });
+        drop(self.agent.cleanup(operation));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Private generation, timestamp, signing-flag, and session-binding invariants.
+    //! Private revocation, timestamp, signing-flag, and session-binding invariants.
 
     use super::*;
     use keyring_store_memory::MemoryStore;
@@ -634,12 +652,12 @@ mod tests {
         ///
         /// Only private snapshot and transition-guard tests bypass the unlock lifecycle.
         fn publish(agent: &Agent, records: Vec<KeyRecord>) -> Result<()> {
-            let generation = {
+            let revoked = {
                 let mut current = agent.state();
                 current.state = control::State::Loading;
-                current.generation
+                current.revoked.clone()
             };
-            let bindings = agent.import(records, generation)?;
+            let bindings = agent.import(records, &revoked)?;
             let mut current = agent.state();
             current.keys = bindings;
             current.state = control::State::Unlocked;
@@ -696,16 +714,18 @@ mod tests {
         agent.state().snapshot = Some(control::Snapshot {
             loaded_at: "2000-01-01T00:00:00Z".into(),
         });
-        let session = agent.session();
-        let keys = session.identities()?;
+        let revoked = agent.state().revoked.clone();
+        let keys = agent.identities(&revoked)?;
         assert_eq!(keys.len(), 2);
         assert!(keys[0].0 < keys[1].0);
-        let signature = session.sign(keys[0].0.encode_vec()?, b"hello".to_vec(), 0).await?;
+        let signature = agent
+            .sign(&revoked, keys[0].0.encode_vec()?, b"hello".to_vec(), 0)
+            .await?;
         signature::Verifier::verify(&ssh_key::PublicKey::from(keys[0].0.clone()), b"hello", &signature)?;
         // RSA-specific flags must still be rejected for an Ed25519 identity.
         assert!(
-            session
-                .sign(keys[0].0.encode_vec()?, Vec::new(), RSA_SHA2_256)
+            agent
+                .sign(&revoked, keys[0].0.encode_vec()?, Vec::new(), RSA_SHA2_256)
                 .await
                 .is_err()
         );
@@ -737,9 +757,10 @@ mod tests {
     #[tokio::test]
     async fn extension_json_unknown_extensions_and_query_are_consistent() -> Result<()> {
         let agent = Fixture::agent(vec![Arc::new(MemoryStore::default())])?;
-        let mut session = agent.session();
-        let Response::Extension(Some((name, details))) =
-            session.extension(control::STATUS.into(), Vec::new().into()).await?
+        let mut binds = Vec::new();
+        let Response::Extension(Some((name, details))) = agent
+            .extension(control::STATUS.into(), Vec::new().into(), &mut binds)
+            .await?
         else {
             bail!("missing status response");
         };
@@ -751,18 +772,16 @@ mod tests {
         assert!(keys.is_empty());
         // Refresh has no server extension: clients compose lock and a fresh unlock.
         for name in ["unknown", "refresh@keyring"] {
-            assert!(session.extension(name.into(), Vec::new().into()).await.is_err());
-            assert!(matches!(
-                session
-                    .handle(Request::Extension {
-                        name: name.into(),
-                        details: Vec::new().into(),
-                    })
-                    .await,
-                Response::Extension(None)
-            ));
+            assert!(
+                agent
+                    .extension(name.into(), Vec::new().into(), &mut binds)
+                    .await
+                    .is_err()
+            );
         }
-        let Response::Extension(Some((_, query))) = session.extension("query".into(), Vec::new().into()).await? else {
+        let Response::Extension(Some((_, query))) =
+            agent.extension("query".into(), Vec::new().into(), &mut binds).await?
+        else {
             bail!("missing query response");
         };
         let bytes = query.as_slice();
@@ -773,12 +792,9 @@ mod tests {
                 .any(|window| window == control::UNLOCK.as_bytes())
         );
         for name in [control::LOCK, control::STATUS] {
-            let Response::Extension(Some((response_name, details))) = session
-                .handle(Request::Extension {
-                    name: name.into(),
-                    details: b"invalid".to_vec().into(),
-                })
-                .await
+            let Response::Extension(Some((response_name, details))) = agent
+                .extension(name.into(), b"invalid".to_vec().into(), &mut binds)
+                .await?
             else {
                 bail!("missing control failure response");
             };
@@ -788,22 +804,17 @@ mod tests {
                 control::Response::Failure { code, .. } if code == "usage"
             ));
         }
-        let response = session
-            .handle(Request::Extension {
-                name: control::LOCK.into(),
-                details: Vec::new().into(),
-            })
-            .await;
+        let response = agent
+            .extension(control::LOCK.into(), Vec::new().into(), &mut binds)
+            .await?;
         assert!(matches!(response, Response::Extension(Some(_))));
-        assert!(matches!(session.handle(Request::Unsupported).await, Response::Failure));
         Ok(())
     }
 
-    #[tokio::test]
-    async fn session_bind_verifies_host_keys_and_rejects_replay_and_chain_extensions() -> Result<()> {
+    #[test]
+    fn session_bind_verifies_host_keys_and_rejects_replay_and_chain_extensions() -> Result<()> {
         use ssh_key::EcdsaCurve;
 
-        let agent = Fixture::agent(vec![Arc::new(MemoryStore::default())])?;
         for algorithm in [
             Algorithm::Ed25519,
             Algorithm::Ecdsa {
@@ -818,69 +829,28 @@ mod tests {
             Algorithm::Rsa { hash: None },
         ] {
             let key = PrivateKey::random(&mut rand::rng(), algorithm)?;
-            let mut session = agent.session();
+            let mut binds = Vec::new();
             let mut corrupted = Fixture::binding(&key, b"corrupted", true)?;
             let last_signature_byte = corrupted.len() - 2;
             corrupted[last_signature_byte] ^= 1;
-            assert!(matches!(
-                session
-                    .handle(Request::Extension {
-                        name: BIND.into(),
-                        details: corrupted,
-                    })
-                    .await,
-                Response::Extension(None)
-            ));
+            assert!(Agent::bind(&mut binds, &corrupted).is_err());
             let mut trailing = Fixture::binding(&key, b"trailing", true)?;
             trailing.push(0);
-            assert!(session.extension(BIND.into(), trailing).await.is_err());
-            assert!(session.binds.is_empty());
-            assert!(matches!(
-                session
-                    .handle(Request::Extension {
-                        name: BIND.into(),
-                        details: Fixture::binding(&key, b"forwarded", true)?,
-                    })
-                    .await,
-                Response::Success
-            ));
-            assert!(
-                session
-                    .extension(BIND.into(), Fixture::binding(&key, b"forwarded", true)?)
-                    .await
-                    .is_err()
-            );
-            assert!(matches!(
-                session
-                    .extension(BIND.into(), Fixture::binding(&key, b"endpoint", false)?)
-                    .await?,
-                Response::Success
-            ));
-            assert!(
-                session
-                    .extension(BIND.into(), Fixture::binding(&key, b"next", true)?)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(session.binds.len(), 2);
+            assert!(Agent::bind(&mut binds, &trailing).is_err());
+            assert!(binds.is_empty());
+            Agent::bind(&mut binds, &Fixture::binding(&key, b"forwarded", true)?)?;
+            assert!(Agent::bind(&mut binds, &Fixture::binding(&key, b"forwarded", true)?).is_err());
+            Agent::bind(&mut binds, &Fixture::binding(&key, b"endpoint", false)?)?;
+            assert!(Agent::bind(&mut binds, &Fixture::binding(&key, b"next", true)?).is_err());
+            assert_eq!(binds.len(), 2);
         }
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[11; 32]));
-        let mut session = agent.session();
+        let mut binds = Vec::new();
         for identifier in 0..64u8 {
-            assert!(matches!(
-                session
-                    .extension(BIND.into(), Fixture::binding(&key, &[identifier; 32], true)?)
-                    .await?,
-                Response::Success
-            ));
+            Agent::bind(&mut binds, &Fixture::binding(&key, &[identifier; 32], true)?)?;
         }
-        assert!(
-            session
-                .extension(BIND.into(), Fixture::binding(&key, b"too long", true)?)
-                .await
-                .is_err()
-        );
-        assert_eq!(session.binds.len(), 64);
+        assert!(Agent::bind(&mut binds, &Fixture::binding(&key, b"too long", true)?).is_err());
+        assert_eq!(binds.len(), 64);
         Ok(())
     }
 
@@ -888,32 +858,38 @@ mod tests {
     #[test]
     fn rsa_flag_mapping_rejects_sha1_and_preserves_sha256_precedence() {
         let rsa = KeySpec::Rsa { bits: 2048 };
-        assert!(Session::algorithm(&rsa, 0).is_err());
-        assert!(Session::algorithm(&rsa, 0x80).is_err());
+        assert!(Agent::algorithm(&rsa, 0).is_err());
+        assert!(Agent::algorithm(&rsa, 0x80).is_err());
         assert_eq!(
-            Session::algorithm(&rsa, RSA_SHA2_256 | RSA_SHA2_512).ok(),
+            Agent::algorithm(&rsa, RSA_SHA2_256 | RSA_SHA2_512).ok(),
             Some(Algorithm::Rsa {
                 hash: Some(HashAlg::Sha256)
             })
         );
         assert_eq!(
-            Session::algorithm(&rsa, RSA_SHA2_512).ok(),
+            Agent::algorithm(&rsa, RSA_SHA2_512).ok(),
             Some(Algorithm::Rsa {
                 hash: Some(HashAlg::Sha512)
             })
         );
     }
 
-    /// A queued import cannot repopulate a store after its generation was invalidated.
+    /// A queued import cannot repopulate a store after its token was revoked.
     #[test]
     fn cancelled_import_cannot_write_keys_after_cleanup() -> Result<()> {
         let memory = Arc::new(MemoryStore::default());
         let agent = Fixture::agent(vec![memory.clone()])?;
         agent.state().state = control::State::Loading;
-        let generation = agent.state().generation;
+        let revoked = agent.state().revoked.clone();
         agent.invalidate();
-        agent.clear_stores()?;
-        assert!(agent.import(vec![Fixture::record(1)?], generation).is_err());
+        {
+            let _storage = agent
+                .storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            agent.clear_stores()?;
+        }
+        assert!(agent.import(vec![Fixture::record(1)?], &revoked).is_err());
         assert!(memory.list()?.is_empty());
         assert!(matches!(
             agent.status(),
@@ -922,6 +898,11 @@ mod tests {
                 ..
             }
         ));
+        Fixture::publish(&agent, vec![Fixture::record(2)?])?;
+        assert!(revoked.is_cancelled());
+        assert!(agent.identities(&revoked).is_err());
+        let current = agent.state().revoked.clone();
+        assert_eq!(agent.identities(&current)?.len(), 1);
         Ok(())
     }
 }

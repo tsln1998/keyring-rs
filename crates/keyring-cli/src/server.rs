@@ -1,25 +1,10 @@
-//! Connection serving and orderly agent shutdown.
-//!
-//! A connection captures one agent generation. State transitions invalidate that generation
-//! so old SSH clients cannot continue using a snapshot after lock.
+//! Connection acceptance and orderly agent shutdown.
 
-use crate::{
-    platform::{Listener, Signal},
-    protocol,
-};
+use crate::platform::{Listener, Signal};
 use anyhow::Result;
-use keyring_protocol::{
-    agent::{Agent, Session},
-    codec::Request,
-    control,
-};
+use keyring_protocol::agent::Agent;
 use std::{sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, watch},
-    task::{JoinHandle, JoinSet},
-    time::timeout,
-};
+use tokio::{task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 /// Accepts clients until shutdown, then drains connections and clears the agent's stores.
@@ -27,417 +12,36 @@ pub async fn serve(path: &str, agent: Arc<Agent>) -> Result<()> {
     let mut listener = Listener::bind(path).await?;
     let mut signal = Signal::new()?;
     let mut jobs = JoinSet::new();
-    let (stop, _) = watch::channel(false);
-    loop {
+
+    let shutdown = CancellationToken::new();
+    let result = loop {
         tokio::select! {
             biased;
-            _ = signal.recv() => break,
+            _ = signal.recv() => break Ok(()),
             _ = jobs.join_next(), if !jobs.is_empty() => {},
             stream = listener.accept() => {
-                let stream = stream?;
-                let session = agent.session();
-                let generation = agent.subscribe();
-                let stop = stop.subscribe();
+                let stream = match stream {
+                    Ok(stream) => stream,
+                    Err(error) => break Err(error.into()),
+                };
+                let agent = Arc::clone(&agent);
+                let shutdown = shutdown.clone();
                 jobs.spawn(async move {
-                    if handle(stream, session, generation, stop).await.is_err() {
+                    if agent.serve(stream, shutdown).await.is_err() {
                         tracing::debug!("client connection closed after request or transport failure");
                     }
                 });
             }
         }
-    }
-    stop.send_replace(true);
-    // Let connection tasks finish bounded in-flight work before forcing their async cancellation.
-    if timeout(Duration::from_secs(30), async {
+    };
+    shutdown.cancel();
+    // Let active requests finish before aborting any remaining connections.
+    let _ = timeout(Duration::from_secs(30), async {
         while jobs.join_next().await.is_some() {}
     })
-    .await
-    .is_err()
-    {
-        jobs.abort_all();
-        while jobs.join_next().await.is_some() {}
-    }
-    // Backend cleanup is awaited after connections drain; failures propagate to the process.
+    .await;
+    jobs.shutdown().await;
+    // Wait for rollback and backend cleanup before returning the listener result.
     timeout(Duration::from_secs(30), agent.clear()).await??;
-    Ok(())
-}
-
-/// Aborts the connection's read-ahead task when its owning handler is dropped.
-struct ReaderTask(JoinHandle<()>);
-
-impl Drop for ReaderTask {
-    /// Prevents a detached reader from retaining the socket or queued unlock requests.
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Processes one connection sequentially while independently observing disconnects.
-///
-/// Deadlines or cancellation drop the in-flight async request. The agent owns rollback;
-/// blocking KDF or backend work already started may finish before cleanup completes.
-pub async fn handle<Stream>(
-    stream: Stream,
-    mut session: Session,
-    mut generation: watch::Receiver<u64>,
-    mut stop: watch::Receiver<bool>,
-) -> Result<()>
-where
-    Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let disconnected = CancellationToken::new();
-    let reader_cancelled = disconnected.clone();
-    // Bound read-ahead, including password-bearing extension payloads awaiting dispatch.
-    let (sender, mut receiver) = mpsc::channel(16);
-    let _reader = ReaderTask(tokio::spawn(async move {
-        // Any reader exit, including task abort, notifies an in-flight request of disconnect.
-        let _guard = reader_cancelled.drop_guard();
-        while let Ok(request) = protocol::read_request(&mut reader).await {
-            if sender.send(request).await.is_err() {
-                break;
-            }
-        }
-    }));
-    loop {
-        if *stop.borrow() {
-            break;
-        }
-        let incoming = tokio::select! {
-            biased;
-            _ = stop.changed() => break,
-            _ = generation.changed() => break,
-            _ = disconnected.cancelled() => break,
-            incoming = receiver.recv() => incoming,
-        };
-        let Some(incoming) = incoming else { break };
-        let unlock = matches!(&incoming, Request::Extension { name, .. } if name == control::UNLOCK);
-        let control_request = matches!(&incoming, Request::Extension { name, .. }
-            if matches!(name.as_str(), control::UNLOCK | control::LOCK | control::STATUS));
-        // Unlock has a larger budget for its explicit remote load and cryptographic work.
-        let budget = if unlock { 180 } else { 30 };
-        timeout(Duration::from_secs(budget), async {
-            let response = tokio::select! {
-                biased;
-                _ = disconnected.cancelled() => anyhow::bail!("client disconnected"),
-                // Lock changes the generation itself, but must still deliver its control response.
-                _ = generation.changed(), if !control_request => anyhow::bail!("session invalidated"),
-                _ = stop.changed(), if unlock => anyhow::bail!("unlock cancelled by service transition"),
-                response = session.handle(incoming) => response,
-            };
-            tokio::select! {
-                biased;
-                // Suppress stale ordinary responses if a transition occurred during the request.
-                _ = generation.changed(), if !control_request => anyhow::bail!("session invalidated before response"),
-                _ = disconnected.cancelled() => anyhow::bail!("client disconnected"),
-                result = protocol::write(&mut writer, &response) => result,
-            }
-        })
-        .await??;
-        // A successful control response can be the final message of the old generation.
-        if generation.has_changed().unwrap_or(true) {
-            break;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    //! In-memory transport checks for control routing and disconnect-triggered unlock rollback.
-
-    mod unlock {
-        //! Encrypted provider fixture covering explicit unlock, local SSH use, and lock cleanup.
-        //!
-        //! The fixture serves only token and sync responses. Later identity and signing requests
-        //! must use the imported backend material without any additional remote access.
-
-        use super::*;
-        use anyhow::Context;
-        use bitwarden_crypto::{EncString, Kdf, KeyEncryptable, MasterKey};
-        use keyring_core::keystore::{KeyStore, Kind};
-        use serde_json::json;
-        use ssh_key::{LineEnding, PrivateKey, private::Ed25519Keypair};
-        use std::num::NonZeroU32;
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::TcpListener,
-        };
-
-        /// Public test input used to encrypt the fixture, never a real account credential.
-        const PASSWORD: &str = "fixture-master-password";
-
-        /// Loads an encrypted SSH key, verifies local signing, then locks and closes old sessions.
-        #[tokio::test]
-        async fn unlock_sign_without_remote_access_and_lock_roundtrip() -> Result<()> {
-            crate::init();
-
-            // Mirror the provider's password-derived user-key wrapping with inexpensive fixture parameters.
-            let master = MasterKey::derive(
-                PASSWORD,
-                "fixture@example.com",
-                &Kdf::PBKDF2 {
-                    iterations: NonZeroU32::new(5000).context("invalid KDF iterations")?,
-                },
-            )?;
-            let (user, wrapped) = master.make_user_key()?;
-            let key = PrivateKey::from(Ed25519Keypair::from_seed(&[17; 32]));
-            let pem = key.to_openssh(LineEnding::LF)?;
-            let encrypted_pem: EncString = pem.as_str().encrypt_with_key(&user.0)?;
-            let encrypted_name: EncString = "fixture key".encrypt_with_key(&user.0)?;
-            // This personal-vault fixture includes an encrypted account field but no organization key.
-            let encrypted_private: EncString = "fixture-no-org-key".encrypt_with_key(&user.0)?;
-            let token = json!({
-                "access_token": "fixture-token", "expires_in": 3600,
-                "privateKey": encrypted_private.to_string(),
-                "userDecryptionOptions": { "masterPasswordUnlock": {
-                    "kdf": { "kdfType": 0, "iterations": 5000 },
-                    "salt": "fixture@example.com", "masterKeyEncryptedUserKey": wrapped.to_string()
-                }}
-            });
-            let sync = json!({"profile": {}, "ciphers": [{
-                "id": "00000000-0000-0000-0000-000000000001",
-                "type": 5, "name": encrypted_name.to_string(),
-                "sshKey": { "privateKey": encrypted_pem.to_string() }
-            }]});
-            let http = TcpListener::bind("127.0.0.1:0").await?;
-            let url = format!("http://{}", http.local_addr()?);
-            let fixture = tokio::spawn(async move {
-                let mut requests = Vec::new();
-                // Exactly two responses are available; returning ends the listener's lifetime.
-                for body in [token, sync] {
-                    let (mut stream, _) = http.accept().await?;
-                    // Read headers and the declared body separately so request assertions include both.
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") {
-                        anyhow::ensure!(header.len() < 65536, "fixture header too large");
-                        header.push(stream.read_u8().await?);
-                    }
-                    let header = String::from_utf8(header)?;
-                    let length = header
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(str::trim)
-                                .map(str::to_owned)
-                        })
-                        .map(|length| length.parse::<usize>())
-                        .transpose()?
-                        .unwrap_or(0);
-                    let mut request_body = vec![0; length];
-                    stream.read_exact(&mut request_body).await?;
-                    requests.push(format!("{header}{}", String::from_utf8(request_body)?));
-                    let body = serde_json::to_vec(&body)?;
-                    stream
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    stream.write_all(&body).await?;
-                    stream.shutdown().await?;
-                }
-                Ok::<_, anyhow::Error>(requests)
-            });
-            let memory = Arc::new(keyring_store_memory::MemoryStore::default());
-            let agent = Agent::new(
-                Arc::new(BitwardenProvider::new(BitwardenConfig {
-                    api_url: url.clone(),
-                    identity_url: url,
-                    client_id: "fixture-client".into(),
-                    client_secret: "fixture-secret".to_owned().into(),
-                })?),
-                vec![memory.clone()],
-            )?;
-            let (_stop, stop) = watch::channel(false);
-            let (mut client, server) = tokio::io::duplex(4096);
-            let serving = tokio::spawn(handle(server, agent.session(), agent.subscribe(), stop.clone()));
-            protocol::write(
-                &mut client,
-                &Request::Extension {
-                    name: control::UNLOCK.into(),
-                    details: PASSWORD.as_bytes().to_vec().into(),
-                },
-            )
-            .await?;
-            let Response::Extension(Some((name, details))) =
-                timeout(Duration::from_secs(10), protocol::read_response(&mut client)).await??
-            else {
-                anyhow::bail!("unlock response missing");
-            };
-            assert_eq!(name, control::UNLOCK);
-            let response: control::Response = serde_json::from_slice(&details)?;
-            assert!(matches!(response, control::Response::Success), "{response:?}");
-            let control::Response::Status { state, keys, .. } = agent.status() else {
-                anyhow::bail!("status missing");
-            };
-            assert_eq!(state, control::State::Unlocked);
-            assert_eq!(keys[0].store, Kind::Memory);
-            assert_eq!(memory.list()?.len(), 1);
-            // Repeated identity reads must reuse the completed snapshot rather than reload the vault.
-            for _ in 0..2 {
-                protocol::write(&mut client, &Request::Identities).await?;
-                let Response::Identities(identities) = protocol::read_response(&mut client).await? else {
-                    anyhow::bail!("identities missing");
-                };
-                assert_eq!(identities.len(), 1);
-                assert_eq!(&identities[0].0, key.public_key().key_data());
-                assert_eq!(identities[0].1, "fixture key");
-            }
-            protocol::write(
-                &mut client,
-                &Request::Signature {
-                    key: key.public_key().to_bytes()?,
-                    data: b"end-to-end signature".to_vec(),
-                    flags: 0,
-                },
-            )
-            .await?;
-            let Response::Signature(signature) = protocol::read_response(&mut client).await? else {
-                anyhow::bail!("signature missing");
-            };
-            signature::Verifier::verify(key.public_key(), b"end-to-end signature", &signature)?;
-            let requests = timeout(Duration::from_secs(5), fixture).await???;
-            assert_eq!(requests.len(), 2);
-            assert!(requests[0].starts_with("POST /connect/token"));
-            assert!(requests[1].starts_with("GET /sync?"));
-            assert!(!requests.join("\n").contains(PASSWORD));
-            // Lock from a separate connection to exercise invalidation of the existing SSH session.
-            let (mut control_client, control_server) = tokio::io::duplex(4096);
-            let locking = tokio::spawn(handle(control_server, agent.session(), agent.subscribe(), stop));
-            protocol::write(
-                &mut control_client,
-                &Request::Extension {
-                    name: control::LOCK.into(),
-                    details: Vec::new().into(),
-                },
-            )
-            .await?;
-            let Response::Extension(Some((name, details))) = protocol::read_response(&mut control_client).await? else {
-                anyhow::bail!("lock response missing");
-            };
-            assert_eq!(name, control::LOCK);
-            assert!(matches!(serde_json::from_slice(&details)?, control::Response::Success));
-            assert!(matches!(
-                agent.status(),
-                control::Response::Status {
-                    state: control::State::Locked,
-                    ..
-                }
-            ));
-            assert!(memory.list()?.is_empty());
-            // Both the old signing connection and the lock connection finish after the generation changes.
-            assert!(
-                timeout(Duration::from_secs(5), protocol::read_response(&mut client))
-                    .await?
-                    .is_err()
-            );
-            timeout(Duration::from_secs(5), serving).await???;
-            timeout(Duration::from_secs(5), locking).await???;
-            Ok(())
-        }
-    }
-
-    use super::*;
-    use keyring_protocol::codec::Response;
-    use keyring_provider::{BitwardenProvider, config::BitwardenConfig};
-    use std::sync::Arc;
-
-    /// Creates a memory-only agent whose provider requests target a controlled local endpoint.
-    fn agent(url: &str) -> Result<Arc<Agent>> {
-        Agent::new(
-            Arc::new(BitwardenProvider::new(BitwardenConfig {
-                api_url: url.into(),
-                identity_url: url.into(),
-                client_id: "fixture".into(),
-                client_secret: "fixture".to_owned().into(),
-            })?),
-            vec![Arc::new(keyring_store_memory::MemoryStore::default())],
-        )
-    }
-
-    /// Distinguishes SSH failures, unknown extensions, and a valid locked-status response.
-    #[tokio::test]
-    async fn control_roundtrip_unknown_extension_and_locked_identities() -> Result<()> {
-        let agent = agent("http://127.0.0.1:1")?;
-        let (mut client, server) = tokio::io::duplex(4096);
-        let (_stop, stop) = watch::channel(false);
-        let serving = tokio::spawn(handle(server, agent.session(), agent.subscribe(), stop));
-        protocol::write(&mut client, &Request::Identities).await?;
-        assert!(matches!(protocol::read_response(&mut client).await?, Response::Failure));
-        protocol::write(
-            &mut client,
-            &Request::Extension {
-                name: "unknown".into(),
-                details: Vec::new().into(),
-            },
-        )
-        .await?;
-        assert!(matches!(
-            protocol::read_response(&mut client).await?,
-            Response::Extension(None)
-        ));
-        protocol::write(
-            &mut client,
-            &Request::Extension {
-                name: control::STATUS.into(),
-                details: Vec::new().into(),
-            },
-        )
-        .await?;
-        let Response::Extension(Some((name, details))) = protocol::read_response(&mut client).await? else {
-            anyhow::bail!("missing control response");
-        };
-        assert_eq!(name, control::STATUS);
-        assert!(matches!(
-            serde_json::from_slice(&details)?,
-            control::Response::Status {
-                state: control::State::Locked,
-                ..
-            }
-        ));
-        drop(client);
-        serving.await??;
-        Ok(())
-    }
-
-    /// Drops the client after authentication starts and checks the agent returns to locked state.
-    #[tokio::test]
-    async fn disconnect_during_unlock_rolls_back_to_locked() -> Result<()> {
-        crate::init();
-        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let agent = agent(&format!("http://{}", http.local_addr()?))?;
-        let (mut client, server) = tokio::io::duplex(4096);
-        let (_stop, stop) = watch::channel(false);
-        let serving = tokio::spawn(handle(server, agent.session(), agent.subscribe(), stop));
-        protocol::write(
-            &mut client,
-            &Request::Extension {
-                name: control::UNLOCK.into(),
-                details: b"never-log-fixture-password".to_vec().into(),
-            },
-        )
-        .await?;
-        // Accept without replying so the disconnect happens during a pending remote request.
-        let (_http_connection, _) = timeout(Duration::from_secs(5), http.accept()).await??;
-        assert!(matches!(
-            agent.status(),
-            control::Response::Status {
-                state: control::State::Loading,
-                ..
-            }
-        ));
-        drop(client);
-        assert!(timeout(Duration::from_secs(5), serving).await??.is_err());
-        assert!(matches!(
-            agent.status(),
-            control::Response::Status { state: control::State::Locked, keys, .. } if keys.is_empty()
-        ));
-        agent.clear().await?;
-        Ok(())
-    }
+    result
 }

@@ -1,9 +1,67 @@
 use keyring_protocol::{
-    codec::{Request, Response},
+    codec::{Codec, Request, Response},
     control,
 };
 use ssh_encoding::{Decode, Encode};
 use ssh_key::Signature;
+use tokio::io::AsyncWriteExt;
+
+#[tokio::test]
+async fn framing_accepts_fragmented_packets_and_rejects_oversized_headers() -> anyhow::Result<()> {
+    let (reader, mut writer) = tokio::io::duplex(64);
+    let sender = tokio::spawn(async move {
+        for byte in [0, 0, 0, 1, 11] {
+            writer.write_all(&[byte]).await?;
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    assert!(matches!(Codec::new(reader).read().await?, Request::Identities));
+    sender.await??;
+    let (reader, mut writer) = tokio::io::duplex(64);
+    writer.write_u32(1024 * 1024 + 1).await?;
+    assert!(Codec::new(reader).read::<Request>().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn framing_rejects_empty_truncated_and_trailing_data() {
+    for bytes in [
+        b"\0\0\0\0".as_slice(),
+        b"\0\0\0\x02\x0b\0",
+        b"\0\0\0\x04\x0b",
+        b"\0\0\0\x05\x1b\xff\xff\xff\xff",
+    ] {
+        assert!(Codec::new(bytes).read::<Request>().await.is_err());
+    }
+    assert!(
+        Codec::new(b"\0\0\0\x02\x05\0".as_slice())
+            .read::<Response>()
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn framing_rejects_oversized_writes_before_sending_a_header() -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let (mut reader, writer) = tokio::io::duplex(64);
+    let mut writer = Codec::new(writer);
+    assert!(
+        writer
+            .write(&Request::Signature {
+                key: Vec::new(),
+                data: vec![0; 1024 * 1024],
+                flags: 0,
+            })
+            .await
+            .is_err()
+    );
+    drop(writer);
+    assert_eq!(reader.read(&mut [0; 1]).await?, 0);
+    Ok(())
+}
 
 #[test]
 fn request_fixtures_preserve_binary_data_and_raw_extension_tails() -> anyhow::Result<()> {

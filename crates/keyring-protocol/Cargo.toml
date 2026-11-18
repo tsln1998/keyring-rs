@@ -18,6 +18,7 @@ signature.workspace = true
 ssh-encoding.workspace = true
 ssh-key.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 
@@ -39,8 +40,11 @@ ssh-key.features = [
   "rsa",
 ]
 tokio.features = [
+  "io-util",
+  "macros",
   "rt",
   "sync",
+  "time",
 ]
 
 [dev-dependencies]
@@ -51,9 +55,7 @@ tokio.workspace = true
 
 # Features
 tokio.features = [
-  "macros",
   "rt-multi-thread",
-  "time",
 ]
 
 [lints]

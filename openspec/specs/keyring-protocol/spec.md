@@ -9,9 +9,12 @@ Own SSH agent behavior, transactional unlocking, storage orchestration, and cont
 ### Requirement: Public module boundaries
 
 The crate SHALL expose public agent, codec, and control modules without root re-exports.
-The agent module SHALL expose Agent and Session, construct shared services as Arc<Agent>,
-and keep lifecycle state, key routing, rollback, and request-handling helpers private.
-The codec module SHALL own request and response types and their binary encoding.
+The agent module SHALL expose Agent, construct shared services as Arc<Agent>, and provide
+new, serve, and clear as its public methods. Each served connection SHALL own its
+revocation token and OpenSSH binding chain without exposing a separate session type.
+Lifecycle state, key routing, rollback, and request-handling helpers SHALL remain private.
+The codec module SHALL own request and response types, their binary encoding, and Codec
+for bounded asynchronous frame reads and writes.
 The control module SHALL own control extension names and expose Request, Response,
 State, Snapshot, Store, and Key. Request SHALL describe Unlock, Lock, and Status.
 Response SHALL describe Success, Failure, and Status without separate outcome or status
@@ -36,8 +39,9 @@ remains readable during loading. A second unlock SHALL report an already-unlocke
 
 ### Requirement: Public-only binding table
 
-Bindings and identity caches SHALL contain public records, references to selected stores,
-and opaque key handles only. Private key bytes SHALL remain owned by stores.
+Bindings SHALL contain public status metadata captured at import, references to selected
+stores, and opaque key handles only. Public identities SHALL be stored as binding-map
+keys without a duplicate identity in each binding. Private key bytes SHALL remain owned by stores.
 Stores SHALL be called through spawn_blocking. Identity ordering SHALL use KeyData.
 RSA flags SHALL require SHA-2, prefer SHA-256 when both flags are set, and reject unknown flags.
 
@@ -59,14 +63,16 @@ public metadata. Cleanup errors SHALL fail closed rather than publish uncertain 
 - **WHEN** a preferred store rejects an import
 - **THEN** the next eligible store is tried and exactly one home is published.
 
-### Requirement: Explicit loading and generation isolation
+### Requirement: Explicit loading and connection revocation
 
 Only an explicit unlock SHALL authenticate, sync, decrypt, and import keys. The agent SHALL
 retain only public snapshot metadata and backend bindings after loading, with no Bitwarden
 session, access token, or account decryption keys. Snapshot metadata SHALL contain loaded_at
 without an expiry. Idle time, identity listing, signing, and status SHALL NOT initiate
-remote requests or refresh the loaded keys. Lock SHALL invalidate generations before
-clearing stores, and an old generation SHALL never publish an in-flight signature after lock.
+remote requests or refresh the loaded keys. Lock SHALL cancel the current revocation
+token and replace it under the state lock before clearing stores. Connections and workers
+holding the cancelled token SHALL remain revoked after a subsequent unlock and SHALL
+never publish an in-flight signature or import from before lock.
 
 #### Scenario: Remote vault changes after unlock
 
